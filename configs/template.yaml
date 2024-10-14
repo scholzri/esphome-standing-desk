@@ -1,6 +1,24 @@
 external_components:
-  - source: github://tjhorner/esphome-standing-desk
-    components: [ standing_desk_height ]
+  - source:
+      type: git
+      url: https://github.com/scholzri/esphome-standing-desk
+      ref: master
+    components: [ standing_desk_height, desk_keypad ]
+    refresh: 0s
+
+substitutions:
+  desk_height_name: "Desk Height"
+  target_desk_height_name: "Target Desk Height"
+  standing_desk_height_units: "cm"
+  standing_desk_variant: "auto"
+
+sensor:
+  - uart_id: standing_desk_uart
+    platform: standing_desk_height
+    id: desk_height
+    name: ${desk_height_name}
+    unit_of_measurement: ${standing_desk_height_units}
+    variant: ${standing_desk_variant}
 
 substitutions:
   desk_height_name: "Desk Height"
@@ -8,32 +26,13 @@ substitutions:
   standing_desk_height_units: "in"
   standing_desk_variant: "auto"
 
-uart:
-  id: standing_desk_uart
-  rx_pin: ${standing_desk_uart_rx_pin}
-  baud_rate: 9600
-
 sensor:
   - platform: standing_desk_height
+    uart_id: controlbox
     id: desk_height
     name: ${desk_height_name}
     unit_of_measurement: ${standing_desk_height_units}
     variant: ${standing_desk_variant}
-
-output:
-  - platform: gpio
-    inverted: true
-    id: standing_desk_up_pin
-    pin:
-      number: ${standing_desk_up_pin}
-      allow_other_uses: true
-    
-  - platform: gpio
-    inverted: true
-    id: standing_desk_down_pin
-    pin:
-      number: ${standing_desk_down_pin}
-      allow_other_uses: true
 
 number:
   - platform: template
@@ -47,20 +46,6 @@ number:
     step: 0.1
     set_action:
       then:
-        - if:
-            condition:
-              lambda: "return id(desk_height)->get_last_read() > x;"
-            then:
-              - output.turn_on: standing_desk_down_pin
-              - wait_until:
-                  condition:
-                    lambda: "return id(desk_height)->get_last_read() <= x + 0.4;"
-                  timeout: 20s
-              - output.turn_off: standing_desk_down_pin
-            else:
-              - output.turn_on: standing_desk_up_pin
-              - wait_until:
-                  condition:
-                    lambda: "return id(desk_height)->get_last_read() >= x - 0.4;"
-                  timeout: 20s
-              - output.turn_off: standing_desk_up_pin
+        - desk_keypad.move_to_target:
+            id: desk_keypad_control
+            target: !lambda "return x;"

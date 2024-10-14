@@ -8,6 +8,7 @@
 #include "jarvis_decoder.h"
 #include "uplift_decoder.h"
 #include "omnidesk_decoder.h"
+#include "ctb_decoder.h"
 
 #include "decoder_variant.h"
 
@@ -25,6 +26,8 @@ public:
   void update() override;
   void dump_config() override;
   float get_last_read();
+
+  bool process_height_message(const std::vector<uint8_t> &message);
 
 protected:
   Decoder* decoder;

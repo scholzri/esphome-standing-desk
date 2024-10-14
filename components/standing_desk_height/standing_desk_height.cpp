@@ -22,6 +22,9 @@ void StandingDeskHeightSensor::set_decoder_variant(DecoderVariant decoder_varian
     case DECODER_VARIANT_OMNIDESK:
       this->decoder = new OmnideskDecoder();
       break;
+    case DECODER_VARIANT_CTB:
+      this->decoder = new CTBDecoder();
+      break;
     case DECODER_VARIANT_UNKNOWN:
       this->decoder = nullptr;
       return;
@@ -120,6 +123,32 @@ void StandingDeskHeightSensor::dump_config() {
 
 float StandingDeskHeightSensor::get_last_read() {
   return this->last_read;
+}
+
+bool StandingDeskHeightSensor::process_height_message(const std::vector<uint8_t> &message) {
+  // Check if the message has the correct length for a height message
+  if (message.size() != 7) {
+    return false;
+  }
+
+  // Process the height message using the CTB decoder
+  CTBDecoder decoder;
+  for (uint8_t byte : message) {
+    decoder.put(byte);
+  }
+
+  // Attempt to decode the height
+  float height = decoder.decode();
+
+  // Check if the decoded height is valid (you may want to adjust these bounds)
+  if (height >= 61.0 && height <= 126.0) {
+    // Publish the new height state
+    publish_state(height);
+    return true;
+  }
+
+  // If we reach here, the message was not a valid height message
+  return false;
 }
 
 }
