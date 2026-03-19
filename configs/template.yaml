@@ -5,7 +5,6 @@ external_components:
 substitutions:
   desk_height_name: "Desk Height"
   target_desk_height_name: "Target Desk Height"
-  standing_desk_height_units: "in"
   standing_desk_variant: "auto"
 
 uart:
@@ -17,7 +16,6 @@ sensor:
   - platform: standing_desk_height
     id: desk_height
     name: ${desk_height_name}
-    unit_of_measurement: ${standing_desk_height_units}
     variant: ${standing_desk_variant}
 
 output:
@@ -39,7 +37,6 @@ number:
   - platform: template
     id: target_desk_height
     name: ${target_desk_height_name}
-    unit_of_measurement: ${standing_desk_height_units}
     restore_value: true
     optimistic: true
     min_value: ${standing_desk_min_height}

@@ -29,7 +29,6 @@ substitutions:
   # Optional (defaults shown)
   desk_height_name: "Desk Height"
   target_desk_height_name: "Target Desk Height"
-  standing_desk_height_units: "in"
   standing_desk_variant: "auto" # jarvis, uplift, or omnidesk
 ```
 
