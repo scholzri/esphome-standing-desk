@@ -13,20 +13,6 @@ substitutions:
   standing_desk_variant: "auto"
 
 sensor:
-  - uart_id: standing_desk_uart
-    platform: standing_desk_height
-    id: desk_height
-    name: ${desk_height_name}
-    unit_of_measurement: ${standing_desk_height_units}
-    variant: ${standing_desk_variant}
-
-substitutions:
-  desk_height_name: "Desk Height"
-  target_desk_height_name: "Target Desk Height"
-  standing_desk_height_units: "in"
-  standing_desk_variant: "auto"
-
-sensor:
   - platform: standing_desk_height
     uart_id: controlbox
     id: desk_height
