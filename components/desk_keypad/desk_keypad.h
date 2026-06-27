@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/core/automation.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 
@@ -37,6 +38,18 @@ class DeskKeypad : public Component {
   void handle_uart_data();
   void handle_keypad_byte(uint8_t byte);
   void send_message_to_controlbox(const uint8_t* message, uint8_t length);
+};
+
+template<typename... Ts> class MoveToTargetAction : public Action<Ts...> {
+ public:
+  explicit MoveToTargetAction(DeskKeypad *parent) : parent_(parent) {}
+
+  TEMPLATABLE_VALUE(float, target)
+
+  void play(Ts... x) override { this->parent_->move_to_target(this->target_.value(x...)); }
+
+ protected:
+  DeskKeypad *parent_;
 };
 
 }  // namespace desk_keypad

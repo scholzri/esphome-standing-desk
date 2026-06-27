@@ -1,5 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
+from esphome import automation
 from esphome.components import uart, sensor
 from esphome.const import CONF_ID
 
@@ -8,11 +9,13 @@ AUTO_LOAD = ['sensor']
 
 desk_keypad_ns = cg.esphome_ns.namespace('desk_keypad')
 DeskKeypad = desk_keypad_ns.class_('DeskKeypad', cg.Component)
+MoveToTargetAction = desk_keypad_ns.class_('MoveToTargetAction', automation.Action)
 
 CONF_KEYPAD_UART = 'keypad_uart'
 CONF_CONTROLBOX_UART = 'controlbox_uart'
 CONF_INJECTION_INTERVAL = 'injection_interval'
 CONF_HEIGHT_SENSOR = 'height_sensor'
+CONF_TARGET = 'target'
 
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(DeskKeypad),
@@ -36,3 +39,18 @@ async def to_code(config):
 
     cg.add_global(desk_keypad_ns.using)
     cg.add_define("USE_DESK_KEYPAD")
+
+
+MOVE_TO_TARGET_SCHEMA = cv.Schema({
+    cv.GenerateID(): cv.use_id(DeskKeypad),
+    cv.Required(CONF_TARGET): cv.templatable(cv.float_),
+})
+
+
+@automation.register_action("desk_keypad.move_to_target", MoveToTargetAction, MOVE_TO_TARGET_SCHEMA)
+async def move_to_target_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    var = cg.new_Pvariable(action_id, template_arg, paren)
+    template_ = await cg.templatable(config[CONF_TARGET], args, float)
+    cg.add(var.set_target(template_))
+    return var
