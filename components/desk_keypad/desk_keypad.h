@@ -46,7 +46,7 @@ template<typename... Ts> class MoveToTargetAction : public Action<Ts...> {
 
   TEMPLATABLE_VALUE(float, target)
 
-  void play(Ts... x) override { this->parent_->move_to_target(this->target_.value(x...)); }
+  void play(const Ts &...x) override { this->parent_->move_to_target(this->target_.value(x...)); }
 
  protected:
   DeskKeypad *parent_;
