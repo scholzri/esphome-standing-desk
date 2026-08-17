@@ -59,6 +59,6 @@ TEST(crc_check_accepts_valid_and_rejects_corrupted) {
 }
 
 TEST(crc_check_rejects_undersized_frames) {
-  uint8_t frame[2] = {0xAA, 0xFF};
+  uint8_t frame[2] = {0xFF, 0xFF};
   CHECK(!ctb::crc_check(frame, 2));
 }
