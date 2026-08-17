@@ -105,8 +105,12 @@ TEST(recovers_after_a_corrupted_frame) {
   ctb::FrameCodec codec(ctb::Direction::KEYPAD_TO_BOX);
   std::vector<uint8_t> stream = UP;
   stream[4] = 0x00;
-  // MAX_FRAME_LEN of filler forces the codec to give up and resync.
-  for (int i = 0; i < ctb::MAX_FRAME_LEN; i++)
+  // Exactly 58: the corrupted frame leaves 6 bytes buffered, so 58 more fills
+  // the 64-byte buffer precisely. The next byte fed is PRESET1's 0xAA sync,
+  // which therefore lands on the overflow path and must be reprocessed as a
+  // new sync rather than dropped. With uniform filler the two behaviours are
+  // indistinguishable, so this count is what gives the test its teeth.
+  for (int i = 0; i < 58; i++)
     stream.push_back(0x00);
   stream.insert(stream.end(), PRESET1.begin(), PRESET1.end());
   auto frames = feed(codec, stream);

@@ -11,7 +11,10 @@ enum class Direction : uint8_t {
 
 static const uint8_t SYNC_BYTE = 0xAA;
 static const uint8_t MAX_FRAME_LEN = 64;
-// Shortest frame that can carry a CRC: sync, type, one payload byte, two CRC.
+// Shortest possible frame: sync, type, two CRC bytes, and no payload at all.
+// Type 0xF4 is exactly this shape, so four bytes is a real frame length on
+// this wire, not a degenerate case. This is the floor for CRC-terminated
+// scanning of unknown types; raising it would hide 4-byte types.
 static const uint8_t MIN_FRAME_LEN = 4;
 
 struct Frame {
