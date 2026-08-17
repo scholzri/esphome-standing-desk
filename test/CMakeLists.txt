@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(desk_link_tests
   test_main.cpp
   test_ctb_crc.cpp
+  test_frame_codec.cpp
+  ../components/desk_link/frame_codec.cpp
 )
 
 target_compile_options(desk_link_tests PRIVATE -Wall -Wextra)
