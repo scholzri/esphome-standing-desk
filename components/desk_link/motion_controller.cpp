@@ -255,7 +255,12 @@ void MotionController::update(float height_cm, bool valid, uint32_t now_ms) {
       float residual = height_cm - target_cm_;
       if (residual < 0)
         residual = -residual;
-      if (cfg_.allow_correction && !correction_used_ && residual > deadband_at(height_cm)) {
+      // >= rather than >: above 100 cm the display quantises to whole
+      // centimetres, so a stop landing exactly one step short of an integer
+      // target produces a residual that exactly equals the coarse deadband. A
+      // strict > would silently accept that as "close enough" when it is a full
+      // display step off target.
+      if (cfg_.allow_correction && !correction_used_ && residual >= deadband_at(height_cm)) {
         // Exactly one correction excursion is permitted per begin_move().
         // Direction is re-evaluated from where the desk actually is now, and
         // may differ from the initial direction (e.g. an overshoot), but
