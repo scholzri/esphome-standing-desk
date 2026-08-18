@@ -28,11 +28,14 @@ class DeskLink : public Component {
   void inject(const uint8_t *data, uint8_t len, uint16_t count, uint16_t interval_ms);
 
   // Rewrites the command byte of every subsequent idle keypad frame
-  // (AA FF xx 40 ..) to `cmdbyte` for `duration_ms`, as if a key were
-  // physically held. duration_ms == 0 cancels immediately (RELEASE).
-  // duration_ms is capped internally so a dropped capture connection cannot
-  // leave the desk driving indefinitely.
-  void set_hold(uint8_t cmdbyte, uint32_t duration_ms);
+  // (AA FF xx 40 ..) to `cmd` for `duration_ms`, as if a key were
+  // physically held. `param` rewrites the param byte alongside it, since
+  // some button presses (preset recall/store) are only distinguishable by
+  // their param byte, not their command byte alone. duration_ms == 0 cancels
+  // immediately (RELEASE). duration_ms is capped internally so a dropped
+  // capture connection cannot leave the desk driving indefinitely.
+  void set_hold(uint8_t cmd, uint8_t param, uint32_t duration_ms);
+  void recall_preset(uint8_t index);   // index 0-3, zero-based on the wire
 
  protected:
   void handle_keypad_byte_(uint8_t b);
@@ -97,6 +100,7 @@ class DeskLink : public Component {
   // Command-byte override ("hold"), applied only to idle (cmd 0x40) frames.
   bool override_active_{false};
   uint8_t override_cmd_{0};
+  uint8_t override_param_{0x00};
   uint32_t override_deadline_ms_{0};
 
   uint32_t seq_{0};

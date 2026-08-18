@@ -169,6 +169,11 @@ void DeskLink::handle_keypad_byte_(uint8_t b) {
 
   if (whole_frame_pending && this->override_active_ && is_idle_shaped &&
       f.bytes[3] == 0x40) {
+    // Both bytes matter: the command byte is a button bitmask and the param
+    // byte carries the preset index (zero-based). Recalling preset 3 is
+    // AA FF 02 48, so rewriting the command alone can only ever reach
+    // preset 1.
+    this->hold_buf_[2] = this->override_param_;
     this->hold_buf_[3] = this->override_cmd_;
     ctb::crc_append(this->hold_buf_, 4);
     this->controlbox_uart_->write_array(this->hold_buf_, this->hold_len_);
@@ -325,12 +330,23 @@ void DeskLink::service_capture_() {
 }
 
 void DeskLink::handle_command_(char *line) {
-  char verb[8];
+  char verb[16];
   char hex[160];
+  // The 4th token is TX/TXC's decimal interval_ms for one verb and HOLD's
+  // hex param byte for another, so it cannot be scanned directly as %u: a
+  // hex byte containing a letter (e.g. "4A") would stop %u's decimal
+  // conversion after the leading digit and leave the letter to be
+  // (mis)matched as if it were a whole separate token. Capturing it as a
+  // string first and letting each verb below reinterpret it with the base
+  // it actually needs -- exactly how `hex` is already reinterpreted per verb
+  // -- avoids that silent corruption.
+  char param_s[8] = "";
   unsigned count = 1, interval = 38;
-  const int fields = sscanf(line, "%7s %159s %u %u", verb, hex, &count, &interval);
+  const int fields = sscanf(line, "%15s %159s %u %7s", verb, hex, &count, param_s);
   if (fields < 1)
     return;
+  if (fields >= 4)
+    interval = (unsigned) strtoul(param_s, nullptr, 10);
 
   if (strcmp(verb, "STAT") == 0) {
     // Existing fields are kept in place and order -- a workstation script
@@ -356,8 +372,31 @@ void DeskLink::handle_command_(char *line) {
   // RELEASE takes no arguments; HOLD 0 is the same request spelled with an
   // explicit duration of zero. Both cancel any active override.
   if (strcmp(verb, "RELEASE") == 0) {
-    this->set_hold(0, 0);
+    this->set_hold(0, 0x00, 0);
     this->capture_write_("# release\n", 10);
+    return;
+  }
+
+  if (strcmp(verb, "PRESET") == 0 || strcmp(verb, "STOREPRESET") == 0) {
+    // hex is only guaranteed populated (and null-terminated) once sscanf has
+    // actually matched it; without this guard a bare "PRESET" with no
+    // number would read strtoul's argument out of an uninitialized buffer.
+    const unsigned n = (fields >= 2) ? strtoul(hex, nullptr, 10) : 0;
+    if (n < 1 || n > 4) {
+      this->capture_write_("# err preset must be 1-4\n", 25);
+      return;
+    }
+    const uint8_t index = (uint8_t) (n - 1);   // zero-based on the wire
+    if (verb[0] == 'P') {
+      this->recall_preset(index);
+    } else {
+      // 0x44 = base 0x40 | store bit 0x04. Stores the CURRENT height; the
+      // protocol has no way to store an arbitrary one.
+      this->set_hold(0x44, index, 400);
+    }
+    char out[64];
+    int n2 = snprintf(out, sizeof(out), "# %s %u\n", verb, n);
+    this->capture_write_(out, (size_t) n2);
     return;
   }
 
@@ -370,10 +409,13 @@ void DeskLink::handle_command_(char *line) {
     // count carries duration_ms here: HOLD shares the same "verb hex u u"
     // sscanf shape as TX/TXC above, and duration_ms is the first %u field.
     uint32_t duration_ms = count;
-    this->set_hold(cmdbyte, duration_ms);
+    // The 4th token, if present, is the param byte in hex, defaulting to
+    // 0x00 (plain command-byte hold, today's only behaviour) when absent.
+    const uint8_t param = (fields >= 4) ? (uint8_t) strtoul(param_s, nullptr, 16) : 0x00;
+    this->set_hold(cmdbyte, param, duration_ms);
     char out[96];
-    int n = snprintf(out, sizeof(out), "# hold cmd=%02X duration=%u\n", cmdbyte,
-                     (unsigned) duration_ms);
+    int n = snprintf(out, sizeof(out), "# hold cmd=%02X param=%02X duration=%u\n", cmdbyte,
+                     param, (unsigned) duration_ms);
     this->capture_write_(out, (size_t) n);
     return;
   }
@@ -448,7 +490,7 @@ void DeskLink::service_injection_() {
   this->inject_next_ms_ = now + this->inject_interval_ms_;
 }
 
-void DeskLink::set_hold(uint8_t cmdbyte, uint32_t duration_ms) {
+void DeskLink::set_hold(uint8_t cmd, uint8_t param, uint32_t duration_ms) {
   // Capped so a dropped capture connection can never leave the desk driving
   // indefinitely: this is the only path that can end a hold besides RELEASE,
   // a real keypress (hands always win, see handle_keypad_byte_), or
@@ -462,10 +504,25 @@ void DeskLink::set_hold(uint8_t cmdbyte, uint32_t duration_ms) {
     ESP_LOGI(TAG, "hold released");
     return;
   }
-  this->override_cmd_ = cmdbyte;
+  this->override_cmd_ = cmd;
+  this->override_param_ = param;
+  // Assign the existing expiry field that service_hold_expiry_ already
+  // checks, rather than adding a parallel one.
   this->override_deadline_ms_ = millis() + duration_ms;
   this->override_active_ = true;
-  ESP_LOGI(TAG, "hold cmd=0x%02X duration=%u ms", cmdbyte, (unsigned) duration_ms);
+  ESP_LOGI(TAG, "hold cmd=0x%02X param=0x%02X duration=%u ms", cmd, param,
+           (unsigned) duration_ms);
+}
+
+void DeskLink::recall_preset(uint8_t index) {
+  if (index > 3) {
+    ESP_LOGW(TAG, "preset index %u out of range", index);
+    return;
+  }
+  // 0x48 = base 0x40 | preset bit 0x08. A 400 ms hold is comfortably longer
+  // than the 41 ms cadence, so the box sees a real press rather than a
+  // bounce, and it then positions the desk itself.
+  this->set_hold(0x48, index, 400);
 }
 
 void DeskLink::dump_config() {
