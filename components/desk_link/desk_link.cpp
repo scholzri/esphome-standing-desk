@@ -89,16 +89,25 @@ void DeskLink::capture_write_(const char *s, size_t len) {
   int sent = ::send(this->client_fd_, s, len, MSG_DONTWAIT);
   if (sent < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // Never block the loop for the capture channel. Losses are counted so
-      // the collector can see them in the sequence numbers.
+      // Nothing went out, so record framing is still intact. The sequence
+      // number gap makes the loss visible to the collector.
       this->drops_++;
       return;
     }
-    ESP_LOGW(TAG, "capture client lost: errno %d", errno);
+    ESP_LOGW(TAG, "capture client lost on send: errno %d", errno);
     ::close(this->client_fd_);
     this->client_fd_ = -1;
-  } else if ((size_t) sent < len) {
-    this->drops_++;
+    return;
+  }
+  if ((size_t) sent < len) {
+    // Half a record already went out. Whatever we send next would be
+    // concatenated onto it and the collector would parse a glued line.
+    // Dropping the client is the only way to keep the stream trustworthy:
+    // the capture fails loudly instead of yielding corrupt data.
+    ESP_LOGW(TAG, "capture short send (%d of %u), dropping client to preserve framing",
+             sent, (unsigned) len);
+    ::close(this->client_fd_);
+    this->client_fd_ = -1;
   }
 }
 
@@ -132,8 +141,16 @@ void DeskLink::service_capture_() {
     this->client_fd_ = -1;
     return;
   }
-  if (n < 0)
-    return;  // EAGAIN: nothing pending
+  if (n < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+      return;  // genuinely nothing pending
+    // Anything else (ECONNRESET and friends) means the peer is gone. Without
+    // this the single client slot would stay occupied until reboot.
+    ESP_LOGW(TAG, "capture client lost on recv: errno %d", errno);
+    ::close(this->client_fd_);
+    this->client_fd_ = -1;
+    return;
+  }
 
   for (int i = 0; i < n; i++) {
     const char c = rx[i];
@@ -194,6 +211,13 @@ void DeskLink::handle_command_(char *line) {
     ctb::crc_append(bytes, len);
     len += 2;
   }
+
+  // Clamp rather than silently wrap: inject() takes uint16_t and a hardware
+  // operator should see the value that will really be used.
+  if (count > 0xFFFF)
+    count = 0xFFFF;
+  if (interval > 0xFFFF)
+    interval = 0xFFFF;
 
   this->inject(bytes, (uint8_t) len, (uint16_t) count, (uint16_t) interval);
 
