@@ -3,10 +3,19 @@
 namespace ctb {
 
 namespace {
-// Minimum span the velocity window must cover before it is trusted. Below
-// this, two adjacent samples a few milliseconds apart would produce a huge,
-// noisy velocity estimate.
-const uint32_t VEL_MIN_SPAN_MS = 300;
+// The velocity window is time-based, not sample-count-based. A count-based
+// window silently changes duration with the frame rate: 8 samples spans 700 ms
+// in a 100 ms test but only 280 ms at the desk's real 40 ms cadence, which fell
+// below the minimum span and pinned velocity at zero -- and a zero velocity
+// makes the coast distance zero, so the controller never stopped short.
+//
+// Samples older than this, relative to the newest, are discarded from the
+// window (but at least two are always retained).
+const uint32_t VEL_WINDOW_MS = 400;
+// Minimum span the retained samples must cover before the estimate is
+// trusted. Below this, two samples a few milliseconds apart would produce a
+// huge, noisy velocity estimate.
+const uint32_t VEL_MIN_SPAN_MS = 250;
 }  // namespace
 
 void MotionController::configure(const MotionConfig &cfg) { cfg_ = cfg; }
@@ -39,21 +48,46 @@ void MotionController::reset_velocity_window_() {
 void MotionController::record_sample_(float height_cm, uint32_t now_ms) {
   vel_h_[vel_head_] = height_cm;
   vel_t_[vel_head_] = now_ms;
-  vel_head_ = (uint8_t) ((vel_head_ + 1) % VEL_WINDOW);
-  if (vel_count_ < VEL_WINDOW)
+  vel_head_ = (uint8_t) ((vel_head_ + 1) % VEL_CAPACITY);
+  if (vel_count_ < VEL_CAPACITY)
     vel_count_++;
+
+  // Discard samples older than VEL_WINDOW_MS relative to the newest one just
+  // written, but always retain at least two samples so a velocity estimate
+  // remains possible. Samples are appended in non-decreasing time order, so
+  // the held samples age from oldest to newest; the oldest is checked first
+  // and, since age only decreases moving toward the newest sample, the first
+  // one found inside the window means every newer one is too.
+  //
+  // All comparisons use unsigned subtraction (never `<` on raw timestamps)
+  // so a millis() rollover is handled the same way elapsed_at_least_() does.
+  while (vel_count_ > 2) {
+    uint8_t oldest = (uint8_t) ((vel_head_ + VEL_CAPACITY - vel_count_) % VEL_CAPACITY);
+    uint32_t age_ms = (uint32_t) (now_ms - vel_t_[oldest]);
+    if (age_ms <= VEL_WINDOW_MS)
+      break;
+    vel_count_--;
+  }
 
   if (vel_count_ < 2) {
     velocity_cm_s_ = 0.0f;
     return;
   }
 
-  // Oldest sample currently held is `vel_count_` slots behind the write head.
-  uint8_t oldest = (uint8_t) ((vel_head_ + VEL_WINDOW - vel_count_) % VEL_WINDOW);
+  uint8_t oldest = (uint8_t) ((vel_head_ + VEL_CAPACITY - vel_count_) % VEL_CAPACITY);
   uint32_t span_ms = (uint32_t) (now_ms - vel_t_[oldest]);
   if (span_ms < VEL_MIN_SPAN_MS) {
-    // Not enough history yet to trust a rate: stay at zero rather than
-    // dividing by a near-zero, noisy time span.
+    // Not enough history yet, or samples are packed too tightly in time, to
+    // trust a rate: stay at zero rather than dividing by a near-zero, noisy
+    // time span.
+    velocity_cm_s_ = 0.0f;
+    return;
+  }
+  if (span_ms == 0) {
+    // Guard against division by zero if two samples somehow share a
+    // timestamp; span_ms == 0 would already fail the VEL_MIN_SPAN_MS check
+    // above for any sane VEL_MIN_SPAN_MS > 0, but this keeps the arithmetic
+    // safe even if that constant were ever set to zero.
     velocity_cm_s_ = 0.0f;
     return;
   }

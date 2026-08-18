@@ -67,7 +67,11 @@ class MotionController {
   float deadband_at(float height_cm) const;
 
  private:
-  static const uint8_t VEL_WINDOW = 8;   // samples; window also needs >= 300 ms of span
+  // Ring buffer capacity for the velocity window. Not the window's duration
+  // (see VEL_WINDOW_MS in motion_controller.cpp) -- just how many samples of
+  // history can be held at once, generous enough to cover VEL_WINDOW_MS at
+  // any sample rate the desk is expected to run at.
+  static const uint8_t VEL_CAPACITY = 32;
 
   void enter_fault_(FaultReason reason);
   void start_excursion_(float from_height_cm, uint32_t now_ms);
@@ -104,8 +108,8 @@ class MotionController {
   bool stall_anchor_set_{false};
 
   // Sliding window of recent (time, height) samples for velocity estimation.
-  float vel_h_[VEL_WINDOW]{};
-  uint32_t vel_t_[VEL_WINDOW]{};
+  float vel_h_[VEL_CAPACITY]{};
+  uint32_t vel_t_[VEL_CAPACITY]{};
   uint8_t vel_count_{0};
   uint8_t vel_head_{0};   // next slot to write
 };
