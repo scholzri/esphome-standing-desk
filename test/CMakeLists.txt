@@ -10,6 +10,7 @@ add_executable(desk_link_tests
   test_frame_codec.cpp
   test_height_codec.cpp
   test_motion_controller.cpp
+  test_motion_sim.cpp
   ../components/desk_link/frame_codec.cpp
   ../components/desk_link/motion_controller.cpp
 )
