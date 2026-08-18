@@ -141,14 +141,19 @@ void MotionController::process_moving_sample_(float height_cm, uint32_t now_ms) 
   // Stop once the remaining distance is within the coast distance, so the
   // desk drifts onto the target rather than braking on it.
   //
-  // No separate zero-velocity guard is needed, and an earlier one here was
-  // dead code: coast_cm is coast_s * |velocity|, so a zero velocity makes
-  // coast_cm zero too and this test degenerates to remaining <= 0 on its own.
-  // That is also exactly the behaviour wanted when the target equals the
-  // current height, which must complete rather than stall.
+  // Coast has two physically distinct parts: the distance covered during the
+  // fixed command latency (t_latency * |v|), plus the braking distance, which
+  // grows with the square of speed (v^2 / (2 * decel)). No separate
+  // zero-velocity guard is needed: both terms are zero when velocity is zero,
+  // so this test degenerates to remaining <= 0 on its own. That is also
+  // exactly the behaviour wanted when the target equals the current height,
+  // which must complete rather than stall.
   float remaining = remaining_cm_(height_cm);
-  float coast_s = (direction_ == MoveCommand::UP) ? cfg_.coast_up_s : cfg_.coast_down_s;
-  float coast_cm = coast_s * ((velocity_cm_s_ < 0) ? -velocity_cm_s_ : velocity_cm_s_);
+  float abs_v = (velocity_cm_s_ < 0) ? -velocity_cm_s_ : velocity_cm_s_;
+  float latency_s = (direction_ == MoveCommand::UP) ? cfg_.latency_up_s : cfg_.latency_down_s;
+  float decel = (direction_ == MoveCommand::UP) ? cfg_.decel_up_cm_s2 : cfg_.decel_down_cm_s2;
+  float brake_cm = (decel > 0.0f) ? (abs_v * abs_v) / (2.0f * decel) : 0.0f;
+  float coast_cm = latency_s * abs_v + brake_cm;
   if (remaining <= coast_cm) {
     command_ = MoveCommand::NONE;
     state_ = MoveState::SETTLING;
