@@ -104,21 +104,18 @@ void MotionController::process_moving_sample_(float height_cm, uint32_t now_ms) 
     return;
   }
 
-  // Feed-forward stop: the motor keeps coasting after the command is
-  // dropped, so the command must be pulled the moment the remaining
-  // distance is no bigger than the distance the desk will coast through at
-  // its current speed. A zero velocity estimate (fewer than two samples, or
-  // fewer than 300 ms between the oldest and newest) must never satisfy
-  // this on its own, or the move would be declared stopped before the desk
-  // starts. But remaining <= 0 means the desk is already at or past the
-  // target by position alone, which is true regardless of velocity (e.g.
-  // begin_move() to the height the desk is already sitting at) -- that case
-  // must still stop, not wait forever for a velocity estimate that will
-  // never come because the desk correctly never moves.
+  // Stop once the remaining distance is within the coast distance, so the
+  // desk drifts onto the target rather than braking on it.
+  //
+  // No separate zero-velocity guard is needed, and an earlier one here was
+  // dead code: coast_cm is coast_s * |velocity|, so a zero velocity makes
+  // coast_cm zero too and this test degenerates to remaining <= 0 on its own.
+  // That is also exactly the behaviour wanted when the target equals the
+  // current height, which must complete rather than stall.
   float remaining = remaining_cm_(height_cm);
   float coast_s = (direction_ == MoveCommand::UP) ? cfg_.coast_up_s : cfg_.coast_down_s;
   float coast_cm = coast_s * ((velocity_cm_s_ < 0) ? -velocity_cm_s_ : velocity_cm_s_);
-  if (remaining <= coast_cm && (velocity_cm_s_ != 0.0f || remaining <= 0.0f)) {
+  if (remaining <= coast_cm) {
     command_ = MoveCommand::NONE;
     state_ = MoveState::SETTLING;
     settle_start_ms_ = now_ms;
@@ -174,11 +171,17 @@ void MotionController::update(float height_cm, bool valid, uint32_t now_ms) {
       // The desk was asleep. Issuing a command now wakes it, but that first
       // command is consumed waking up and produces no movement, so timing
       // for stall/settle/coast starts only once a real height arrives.
-      // Direction is not yet knowable (no height sample exists at all), so
-      // the nudge direction is an arbitrary fixed choice; it never moves the
-      // desk, it only wakes the link.
+      // Nudge direction follows the target: if we have a last-known height
+      // from a prior completed move, nudge toward the target. Otherwise
+      // default to UP.
       state_ = MoveState::WAKING;
-      command_ = MoveCommand::UP;
+      MoveCommand nudge = MoveCommand::UP;  // fallback
+      if (stall_anchor_cm_ >= cfg_.min_height_cm) {  // have valid last-known height
+        if (target_cm_ < stall_anchor_cm_) {
+          nudge = MoveCommand::DOWN;
+        }
+      }
+      command_ = nudge;
       return;
     }
     start_excursion_(height_cm, now_ms);
@@ -187,7 +190,13 @@ void MotionController::update(float height_cm, bool valid, uint32_t now_ms) {
 
   if (state_ == MoveState::WAKING) {
     if (!valid) {
-      command_ = MoveCommand::UP;
+      MoveCommand nudge = MoveCommand::UP;  // fallback
+      if (stall_anchor_cm_ >= cfg_.min_height_cm) {  // have valid last-known height
+        if (target_cm_ < stall_anchor_cm_) {
+          nudge = MoveCommand::DOWN;
+        }
+      }
+      command_ = nudge;
       return;
     }
     start_excursion_(height_cm, now_ms);
