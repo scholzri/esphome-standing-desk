@@ -170,6 +170,14 @@ void DeskLink::handle_keypad_byte_(uint8_t b) {
     }
   }
 
+  // Surface the frame on the capture stream. `f` is the codec's own copy and
+  // is never touched by the rewrite above, which mutates hold_buf_ instead, so
+  // this reports what the keypad genuinely sent rather than what was forwarded
+  // to the box. That is the direction protocol capture needs: what we injected
+  // is already known, what the keypad said is the thing being discovered.
+  // Without this the entire keypad->box direction is invisible to capture.
+  this->emit_frame_(ctb::Direction::KEYPAD_TO_BOX, f);
+
   this->hold_len_ = 0;
   this->hold_sent_ = 0;
 }
