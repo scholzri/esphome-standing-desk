@@ -26,6 +26,12 @@ inline float decode_height_frame(const Frame &f) {
   if (is_sentinel_frame(f))
     return -1.0f;
 
+  // Honour the codec's CRC verdict. A corrupted frame that still looks
+  // digit-shaped would otherwise decode to a plausible, wrong height, and
+  // acting on a wrong height moves the desk to the wrong place.
+  if (!f.crc_valid)
+    return -1.0f;
+
   const uint8_t b0 = f.bytes[2], b1 = f.bytes[3], b2 = f.bytes[4];
   if (b0 > 9 || b2 > 9 || b1 > 19)
     return -1.0f;   // not digits; not a height report

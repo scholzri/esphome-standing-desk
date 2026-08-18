@@ -27,6 +27,9 @@ TEST(decodes_heights_below_one_metre) {
       frame({0xAA, 0xFF, 0x02, 0x10, 0x06, 0xC1, 0x52})), 66.2f));
   CHECK(decode_close(ctb::decode_height_frame(
       frame({0xAA, 0xFF, 0x03, 0x10, 0x07, 0x0D, 0x62})), 76.3f));
+  // b1 == 10 boundary: real captured frame at 90.8 cm has b0=0x08, b1=0x0A, b2=0x09.
+  CHECK(decode_close(ctb::decode_height_frame(
+      frame({0xAA, 0xFF, 0x08, 0x0A, 0x09, 0x00, 0x00})), 90.8f));
 }
 
 TEST(decodes_heights_at_and_above_one_metre) {
@@ -54,4 +57,25 @@ TEST(rejects_frames_that_are_not_height_reports) {
             frame({0xAA, 0xFF, 0x00, 0x50, 0x2B, 0x08})) < 0.0f);   // 6-byte button frame
   CHECK(!ctb::is_sentinel_frame(
       frame({0xAA, 0xFF, 0x01, 0x12, 0x06, 0x26, 0x97})));
+}
+
+TEST(rejects_malformed_height_frames) {
+  // Right length, wrong type byte.
+  CHECK(ctb::decode_height_frame(
+            frame({0xAA, 0xF4, 0x01, 0x12, 0x06, 0x00, 0x00})) < 0.0f);
+  // Right length and type, wrong sync byte.
+  CHECK(ctb::decode_height_frame(
+            frame({0xBB, 0xFF, 0x01, 0x12, 0x06, 0x00, 0x00})) < 0.0f);
+  // Digit bytes out of range: b1 = 0x1E is 30, beyond any valid digit+10.
+  CHECK(ctb::decode_height_frame(
+            frame({0xAA, 0xFF, 0x01, 0x1E, 0x06, 0x00, 0x00})) < 0.0f);
+  // b0 out of range.
+  CHECK(ctb::decode_height_frame(
+            frame({0xAA, 0xFF, 0x0F, 0x12, 0x06, 0x00, 0x00})) < 0.0f);
+}
+
+TEST(rejects_a_height_frame_whose_crc_failed) {
+  ctb::Frame f = frame({0xAA, 0xFF, 0x01, 0x12, 0x06, 0x26, 0x97});
+  f.crc_valid = false;
+  CHECK(ctb::decode_height_frame(f) < 0.0f);
 }
