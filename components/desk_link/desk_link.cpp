@@ -133,18 +133,30 @@ void DeskLink::handle_box_byte_(uint8_t b) {
   switch (this->controller_.command()) {
     case ctb::MoveCommand::UP:
       this->set_hold(0x50, 0x00, 200);
+      this->override_owned_by_controller_ = true;
       break;
     case ctb::MoveCommand::DOWN:
       this->set_hold(0x60, 0x00, 200);
+      this->override_owned_by_controller_ = true;
       break;
     case ctb::MoveCommand::NONE:
-      // Never cancel an active preset recall from here (its command byte is
-      // 0x48): it must run to completion on its own, cancelled only by a
-      // real keypress (hands-always-win, in handle_keypad_byte_) or its own
-      // natural expiry. Any other active override is a feed-forward hold
-      // that the controller itself has now decided to stop, so release it.
-      if (this->override_active_ && this->override_cmd_ != 0x48)
+      // controller_.command() reports NONE as its default resting state --
+      // true whenever no move is actively driving, which is almost always,
+      // including idle, done, faulted, or simply never invoked. Releasing on
+      // NONE unconditionally would kill ANY active override the instant this
+      // ran, not just one this dispatch itself set: a raw HOLD sent over the
+      // capture socket for testing, a preset recall, or the controller's own
+      // hold during any transient moment it reported NONE. Gating on
+      // override_owned_by_controller_ -- true only in the narrow window right
+      // after the UP/DOWN cases above set it -- means this only ever
+      // releases a hold this exact dispatch created. A preset recall
+      // (recall_preset, cmd 0x48) is never set from inside this switch, so
+      // the flag is never true for it either; the old override_cmd_ != 0x48
+      // check this replaced is therefore no longer needed.
+      if (this->override_active_ && this->override_owned_by_controller_) {
         this->set_hold(0x40, 0x00, 0);
+        this->override_owned_by_controller_ = false;
+      }
       break;
   }
 }
@@ -249,6 +261,11 @@ void DeskLink::handle_keypad_byte_(uint8_t b) {
   if (is_idle_shaped && f.bytes[3] != 0x40) {
     if (this->override_active_) {
       this->override_active_ = false;
+      // A real keypress cancels the hold outright, regardless of who set it,
+      // so any "owned by controller" status it carried is no longer
+      // meaningful and must not survive to be inherited by whatever hold
+      // gets set next.
+      this->override_owned_by_controller_ = false;
       ESP_LOGI(TAG, "keypad cmd 0x%02X cancels active hold", f.bytes[3]);
     }
     for (auto *trig : this->keypad_press_triggers_)
@@ -288,6 +305,9 @@ void DeskLink::service_hold_expiry_() {
     return;
   if ((int32_t) (millis() - this->override_deadline_ms_) >= 0) {
     this->override_active_ = false;
+    // Natural expiry ends the hold the same as any other release: whatever
+    // ownership status it carried no longer applies once it's gone.
+    this->override_owned_by_controller_ = false;
     ESP_LOGI(TAG, "hold expired");
   }
 }
@@ -550,6 +570,19 @@ void DeskLink::service_injection_() {
 }
 
 void DeskLink::set_hold(uint8_t cmd, uint8_t param, uint32_t duration_ms) {
+  // Unconditionally cleared here, at the very start, regardless of which
+  // branch below runs or why this was called. set_hold() is the single
+  // choke point every hold passes through -- the controller dispatch
+  // (handle_box_byte_'s UP/DOWN cases), every capture-socket verb
+  // (HOLD/RELEASE/PRESET/STOREPRESET, via handle_command_), and
+  // recall_preset()/store_preset() -- so clearing it here first, rather than
+  // remembering to clear it at each of those call sites individually, is
+  // what guarantees override_owned_by_controller_ can only ever be true in
+  // the narrow window right after handle_box_byte_'s UP/DOWN cases run: they
+  // are the only callers that re-set it to true immediately after this
+  // function returns.
+  this->override_owned_by_controller_ = false;
+
   // Capped so a dropped capture connection can never leave the desk driving
   // indefinitely: this is the only path that can end a hold besides RELEASE,
   // a real keypress (hands always win, see handle_keypad_byte_), or

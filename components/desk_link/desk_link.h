@@ -264,6 +264,16 @@ class DeskLink : public Component {
   uint8_t override_param_{0x00};
   uint32_t override_deadline_ms_{0};
 
+  // True only while the currently active override was set by this
+  // component's own controller-command dispatch (handle_box_byte_'s UP/DOWN
+  // cases), never by any other caller (a raw HOLD/RELEASE socket command,
+  // recall_preset, store_preset). The controller reports NONE as its default
+  // resting state -- true whenever no move is actively driving, which is
+  // almost always -- so releasing on NONE unconditionally would kill any hold
+  // this dispatch did not itself create. This flag is what lets the release
+  // logic tell those two cases apart.
+  bool override_owned_by_controller_{false};
+
   uint32_t seq_{0};
   uint32_t drops_{0};
 
