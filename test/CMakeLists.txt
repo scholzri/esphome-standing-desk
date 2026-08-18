@@ -9,7 +9,9 @@ add_executable(desk_link_tests
   test_ctb_crc.cpp
   test_frame_codec.cpp
   test_height_codec.cpp
+  test_motion_controller.cpp
   ../components/desk_link/frame_codec.cpp
+  ../components/desk_link/motion_controller.cpp
 )
 
 target_compile_options(desk_link_tests PRIVATE -Wall -Wextra)
