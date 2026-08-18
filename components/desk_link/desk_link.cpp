@@ -17,10 +17,12 @@ namespace desk_link {
 static const char *const TAG = "desk_link";
 
 void DeskLink::setup() {
-  ctb::MotionConfig mc;
-  mc.min_height_cm = this->min_height_cm_;
-  mc.max_height_cm = this->max_height_cm_;
-  this->controller_.configure(mc);
+  // motion_cfg_ (not a throwaway local) so later live-tunable setters
+  // (set_latency_up_s() etc.) can mutate one field and reapply the whole
+  // struct without needing to already know the other three.
+  this->motion_cfg_.min_height_cm = this->min_height_cm_;
+  this->motion_cfg_.max_height_cm = this->max_height_cm_;
+  this->controller_.configure(this->motion_cfg_);
 
   this->listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (this->listen_fd_ < 0) {
@@ -107,6 +109,25 @@ void DeskLink::handle_box_byte_(uint8_t b) {
   // case the controller's wake handling exists for.
   const float h = ctb::decode_height_frame(f);
   const bool valid = (h >= 0.0f);
+  if (valid) {
+    // Cached here, not just fed to controller_.update(), so anything that
+    // needs "the current height" but isn't the motion controller itself
+    // (desk_cover's position feedback) has one place to read it rather than
+    // each keeping its own copy in step with this same decode.
+    this->last_height_cm_ = h;
+    this->has_height_ = true;
+    // Published directly on every valid frame (roughly the box's own
+    // ~40 ms cadence), not on a poll timer: this is what "fed at line rate
+    // rather than the old 500 ms poll" means for desk_height.
+    // Sensor::publish_state() does not deduplicate by value, so a
+    // stationary desk still republishes the same reading on this cadence --
+    // the same thing any other line-rate sensor does; the API layer and HA
+    // recorder are both built to cope with that, and the alternative (a
+    // manual last-value check here) would just reimplement what filters or
+    // recorder-side dedup already do more generally.
+    if (this->height_sensor_ != nullptr)
+      this->height_sensor_->publish_state(h);
+  }
   this->controller_.update(valid ? h : 0.0f, valid, millis());
 
   switch (this->controller_.command()) {
@@ -219,11 +240,19 @@ void DeskLink::handle_keypad_byte_(uint8_t b) {
   // frame in full or only a tail of it (f.bytes[3] is the codec's own
   // parsed copy of the command byte, never mutated by the rewrite above): a
   // real keypress always cancels any active automated hold immediately.
+  //
+  // This is also the one place a genuine keypad frame (not 0x40 idle, not a
+  // hold-override rewrite -- f.bytes[3] is the codec's parsed copy,
+  // unaffected by the rewrite above) is already distinguished from idle
+  // filler, so on_keypad_press fires from here rather than adding a second,
+  // possibly-diverging detection point.
   if (is_idle_shaped && f.bytes[3] != 0x40) {
     if (this->override_active_) {
       this->override_active_ = false;
       ESP_LOGI(TAG, "keypad cmd 0x%02X cancels active hold", f.bytes[3]);
     }
+    for (auto *trig : this->keypad_press_triggers_)
+      trig->trigger(f.bytes[3]);
   }
 
   // Surface the frame on the capture stream. `f` is the codec's own copy and
@@ -422,9 +451,7 @@ void DeskLink::handle_command_(char *line) {
     if (verb[0] == 'P') {
       this->recall_preset(index);
     } else {
-      // 0x44 = base 0x40 | store bit 0x04. Stores the CURRENT height; the
-      // protocol has no way to store an arbitrary one.
-      this->set_hold(0x44, index, 400);
+      this->store_preset(index);
     }
     char out[64];
     int n2 = snprintf(out, sizeof(out), "# %s %u\n", verb, n);
@@ -557,12 +584,43 @@ void DeskLink::recall_preset(uint8_t index) {
   this->set_hold(0x48, index, 400);
 }
 
+void DeskLink::store_preset(uint8_t index) {
+  if (index > 3) {
+    ESP_LOGW(TAG, "preset index %u out of range", index);
+    return;
+  }
+  // 0x44 = base 0x40 | store bit 0x04. Stores the CURRENT height; the
+  // protocol has no way to store an arbitrary one. Mirrors the STOREPRESET
+  // capture-socket verb in handle_command_() exactly (same cmd/param/
+  // duration), just reachable as a direct call instead of only over the
+  // socket.
+  this->set_hold(0x44, index, 400);
+}
+
 void DeskLink::set_preset_height(uint8_t index, float height_cm) {
   if (index < 4)
     this->preset_heights_[index] = height_cm;
 }
 
 void DeskLink::move_to(float target_cm) {
+  // A new request always supersedes an old one cleanly rather than racing
+  // it: if a feed-forward excursion is already under way, abort it before
+  // deciding whether this new target is a preset match or another
+  // feed-forward move. Without this, a feed-forward move already in
+  // progress could still be issuing UP/DOWN holds (see handle_box_byte_'s
+  // command() dispatch) at the same time a freshly recalled preset starts
+  // driving the box itself, or a second begin_move() could silently
+  // re-target an excursion mid-flight in ways MotionController's own
+  // one-correction-per-move bookkeeping was never designed to see. This was
+  // unreachable before this task -- move_to() had no caller yet -- so it
+  // could not previously bite; the cover and the target height number both
+  // call in here now, so it can.
+  if (this->controller_.state() == ctb::MoveState::MOVING ||
+      this->controller_.state() == ctb::MoveState::SETTLING ||
+      this->controller_.state() == ctb::MoveState::WAKING) {
+    this->controller_.abort(millis());
+  }
+
   // Prefer the control box's own positioning when the target is one of the
   // stored presets: it runs a factory deceleration ramp and stops exactly on
   // target, which feed-forward cannot match. preset_heights_[i] == 0 means
@@ -584,6 +642,23 @@ void DeskLink::move_to(float target_cm) {
     }
   }
   this->controller_.begin_move(target_cm, millis());
+}
+
+const char *DeskLink::fault_reason_string() const {
+  switch (this->controller_.fault()) {
+    case ctb::FaultReason::NONE: return "none";
+    case ctb::FaultReason::STALL: return "stall";
+    case ctb::FaultReason::TIMEOUT: return "timeout";
+    case ctb::FaultReason::NO_HEIGHT: return "no_height";
+    case ctb::FaultReason::OUT_OF_RANGE: return "out_of_range";
+    case ctb::FaultReason::ABORTED: return "aborted";
+  }
+  // Every FaultReason enumerator is handled above; this is unreachable
+  // unless the enum grows without a matching case being added here, which a
+  // -Wswitch warning on the switch above should already catch at compile
+  // time. Kept as an explicit, greppable fallback rather than relying on
+  // undefined behaviour for a value outside the enum's defined range.
+  return "unknown";
 }
 
 void DeskLink::dump_config() {

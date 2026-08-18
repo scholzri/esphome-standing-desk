@@ -1,5 +1,9 @@
 #pragma once
+#include <vector>
+
+#include "esphome/components/sensor/sensor.h"
 #include "esphome/components/uart/uart.h"
+#include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "frame_codec.h"
 #include "height_codec.h"
@@ -7,6 +11,22 @@
 
 namespace esphome {
 namespace desk_link {
+
+// Fires with the real command byte whenever a genuine keypad frame (not the
+// 0x40 idle shape, not a hold-override rewrite) passes through
+// handle_keypad_byte_(). Registered from __init__.py the same way
+// matrix_keypad's MatrixKeyTrigger is: a Trigger<uint8_t> subclass held in a
+// vector on the parent component and fired with .trigger(cmd_byte).
+//
+// This is the current ESPHome idiom for a component-level `on_..._byte`
+// automation. An earlier design note called for a hand-rolled
+// CallbackManager<void(uint8_t)> member instead; that class does exist in
+// this pinned ESPHome (2026.6.5, confirmed in esphome/core/helpers.h), but
+// Trigger<uint8_t> is the idiom actually used for this shape of problem --
+// it is exactly what ships in esphome/components/matrix_keypad for the same
+// case (an on_key trigger carrying one uint8_t), and matching an existing
+// component's pattern beats introducing a second way to do the same thing.
+class DeskKeypadPressTrigger : public Trigger<uint8_t> {};
 
 class DeskLink : public Component {
  public:
@@ -16,6 +36,79 @@ class DeskLink : public Component {
   void set_stall_guard_ms(uint32_t ms) { this->stall_guard_ms_ = ms; }
   void set_min_height_cm(float cm) { this->min_height_cm_ = cm; }
   void set_max_height_cm(float cm) { this->max_height_cm_ = cm; }
+  // Readable alongside the existing write-only setters above: desk_cover
+  // needs the configured range to map a HA 0..1 position to/from a target
+  // height (see DeskCover::control() and its position feedback in loop()),
+  // and nothing on DeskLink exposed it before this was written.
+  float min_height_cm() const { return this->min_height_cm_; }
+  float max_height_cm() const { return this->max_height_cm_; }
+
+  // Optional: when set, handle_box_byte_() publishes every valid decoded
+  // height directly to this sensor, at line rate (one publish per box height
+  // frame, i.e. the box's own ~40 ms cadence) rather than the 500 ms poll
+  // the old standing_desk_height component used. desk_link now owns both
+  // UARTs exclusively (see the class comment history in desk_link.cpp), so
+  // a separate polling sensor reading the same controlbox UART id is no
+  // longer possible; this replaces that role directly instead. Optional
+  // (nullptr-checked before use) so desk_link stays usable, e.g. in
+  // sniffer.yaml, without a sensor entity configured at all.
+  void set_height_sensor(sensor::Sensor *s) { this->height_sensor_ = s; }
+
+  // Live-tunable MotionConfig fields. Each mutates the DeskLink-held
+  // motion_cfg_ (seeded from min/max height in setup(), the same values
+  // MotionConfig itself defaults to) and re-applies it via
+  // controller_.configure(), which already replaces the whole config
+  // wholesale (`cfg_ = cfg;` in motion_controller.cpp) -- that existing
+  // behaviour is the entire live-reconfigure mechanism; no new
+  // MotionController API is needed. Kept as four setters rather than one
+  // taking a struct so each can be wired to its own `number:` entity with
+  // its own `on_value` lambda in base.yaml, matching how min/max height are
+  // already exposed individually.
+  void set_latency_up_s(float s) {
+    this->motion_cfg_.latency_up_s = s;
+    this->controller_.configure(this->motion_cfg_);
+  }
+  void set_latency_down_s(float s) {
+    this->motion_cfg_.latency_down_s = s;
+    this->controller_.configure(this->motion_cfg_);
+  }
+  void set_decel_up_cm_s2(float v) {
+    this->motion_cfg_.decel_up_cm_s2 = v;
+    this->controller_.configure(this->motion_cfg_);
+  }
+  void set_decel_down_cm_s2(float v) {
+    this->motion_cfg_.decel_down_cm_s2 = v;
+    this->controller_.configure(this->motion_cfg_);
+  }
+
+  // Diagnostic counters. All were already tracked internally (and reported
+  // over the capture socket's STAT line); these just make them readable from
+  // codegen'd C++, e.g. a sensor's lambda.
+  uint32_t drops() const { return this->drops_; }
+  uint32_t stall_flushes() const { return this->stall_flushes_; }
+  uint32_t full_buffer_flushes() const { return this->full_buffer_flushes_; }
+  uint32_t keypad_crc_errors() const { return this->keypad_codec_.crc_errors(); }
+  uint32_t keypad_resyncs() const { return this->keypad_codec_.resyncs(); }
+  uint32_t box_crc_errors() const { return this->box_codec_.crc_errors(); }
+  uint32_t box_resyncs() const { return this->box_codec_.resyncs(); }
+
+  // Last height decoded from the box stream, and whether one has ever been
+  // seen. handle_box_byte_() already computes this on every box height frame
+  // (to feed controller_.update()) but previously discarded it; it is now
+  // cached here as the one place DeskLink tracks "the current height" for
+  // anything that isn't the motion controller itself -- the cover's position
+  // feedback and the line-rate height sensor both read it from here rather
+  // than each keeping their own copy.
+  float last_height_cm() const { return this->last_height_cm_; }
+  bool has_height() const { return this->has_height_; }
+
+  // Human-readable form of controller().fault(), for a diagnostic text
+  // sensor. Returned as a static string literal; never allocates.
+  const char *fault_reason_string() const;
+
+  void register_keypad_press_trigger(DeskKeypadPressTrigger *trig) {
+    this->keypad_press_triggers_.push_back(trig);
+  }
 
   void setup() override;
   void loop() override;
@@ -40,6 +133,14 @@ class DeskLink : public Component {
   // capture connection cannot leave the desk driving indefinitely.
   void set_hold(uint8_t cmd, uint8_t param, uint32_t duration_ms);
   void recall_preset(uint8_t index);   // index 0-3, zero-based on the wire
+  // Stores the desk's CURRENT height into preset `index` (0-3) on the
+  // control box itself -- the protocol has no way to store an arbitrary
+  // height, only "whatever height it's at right now". Mirrors the
+  // STOREPRESET capture-socket verb (0x44 = base 0x40 | store bit 0x04, see
+  // handle_command_()), exposed here as a public method so YAML button
+  // entities can call it directly instead of only being reachable from the
+  // socket.
+  void store_preset(uint8_t index);
 
   // Records the measured height of stored preset `index` (0-3), so move_to()
   // can recognise when a requested target matches it. 0 means unknown/unset.
@@ -48,7 +149,11 @@ class DeskLink : public Component {
   // positioning when the target is within PRESET_MATCH_CM of a known preset
   // height (it stops exactly on target using its own deceleration ramp,
   // which feed-forward cannot match); otherwise drives the feed-forward
-  // controller_.
+  // controller_. If a feed-forward move is already under way (MOVING,
+  // SETTLING or WAKING), that excursion is aborted first so a new request
+  // always supersedes an old one cleanly rather than racing it -- see the
+  // definition for why this matters now that both the cover and the target
+  // height number call in here.
   void move_to(float target_cm);
   ctb::MotionController &controller() { return this->controller_; }
 
@@ -76,6 +181,33 @@ class DeskLink : public Component {
   ctb::MotionController controller_;
   float preset_heights_[4]{0, 0, 0, 0};   // 0 means unknown
   static constexpr float PRESET_MATCH_CM = 0.6f;
+
+  // DeskLink's own copy of the config last pushed to controller_, so a
+  // single-field change (from a `number:` entity's on_value, e.g.
+  // set_decel_up_cm_s2()) can be folded in and reapplied without callers
+  // having to know or reconstruct the other three fields. Seeded in setup()
+  // from min_height_cm_/max_height_cm_ exactly as before; the four
+  // latency/decel fields start at MotionConfig's own defaults until a
+  // set_*() call overrides one.
+  ctb::MotionConfig motion_cfg_{};
+
+  // Last height decoded in handle_box_byte_(), cached for callers that need
+  // "the current height" outside the motion controller (desk_cover's
+  // position feedback, the line-rate height sensor). has_height_ is false
+  // until the first valid box height frame arrives (mirrors decode_height_
+  // frame()'s own negative-means-invalid convention, but as a bool rather
+  // than a sentinel float so 0 cm, if ever reached, is not mistaken for
+  // "unknown").
+  float last_height_cm_{0.0f};
+  bool has_height_{false};
+  sensor::Sensor *height_sensor_{nullptr};   // optional; see set_height_sensor()
+
+  // Registered on_keypad_press automations (see DeskKeypadPressTrigger).
+  // Fired from handle_keypad_byte_() at the same point that already detects
+  // a genuine (non-idle, non-override) keypress for the hands-always-win
+  // check, so there is exactly one detection point for "was this a real
+  // press", not two.
+  std::vector<DeskKeypadPressTrigger *> keypad_press_triggers_;
 
   uint16_t capture_port_{6789};
   int listen_fd_{-1};
