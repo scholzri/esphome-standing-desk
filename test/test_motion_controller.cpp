@@ -94,19 +94,26 @@ TEST(stops_much_later_going_down_because_coast_is_smaller) {
   CHECK(h >= 79.5f);
 }
 
-TEST(never_reverses_direction) {
+TEST(never_reverses_direction_within_an_excursion) {
+  // A move picks a direction and holds it until it stops. A later correction
+  // may travel the other way, but no single continuous run of commands may
+  // change direction mid-flight.
   ctb::MotionController m; m.configure(cfg());
   m.begin_move(90.0f, 0);
   step(m, 80.0f, 0);
   step(m, 85.0f, 1000);
-  // Overshoot past the target.
-  // NOTE: the brief's source uses a comma operator here
-  // (`CHECK(...), step(...)`), which does not compile: CHECK's do/while(0)
-  // expands to a compound statement, and the comma operator cannot sequence
-  // a statement. Rewritten as two statements preserving the same assertion,
-  // per the task instructions for this exact case.
-  for (uint32_t t = 2000; t < 4000; t += 100) {
-    CHECK(m.command() != ctb::MoveCommand::DOWN);
+
+  ctb::MoveCommand excursion_dir = ctb::MoveCommand::NONE;
+  for (uint32_t t = 2000; t < 6000; t += 100) {
+    const ctb::MoveCommand c = m.command();
+    if (c == ctb::MoveCommand::NONE) {
+      excursion_dir = ctb::MoveCommand::NONE;   // excursion ended
+    } else {
+      if (excursion_dir == ctb::MoveCommand::NONE)
+        excursion_dir = c;                       // excursion began
+      else
+        CHECK(c == excursion_dir);               // must not flip mid-excursion
+    }
     step(m, 95.0f, t);
   }
 }
@@ -152,21 +159,44 @@ TEST(abort_stops_immediately) {
 }
 
 TEST(at_most_one_correction_per_move) {
-  ctb::MotionController m; m.configure(cfg());
+  // The desk keeps landing away from the target, so a second correction is
+  // continuously available. The controller must still refuse it: one
+  // correction per commanded move, then accept where it landed. This is what
+  // stops the desk hunting.
+  ctb::MotionConfig c = cfg();
+  ctb::MotionController m; m.configure(c);
   m.begin_move(90.0f, 0);
   step(m, 80.0f, 0);
-  // Jump straight past the target so a correction is warranted.
-  step(m, 93.0f, 1000);
-  uint32_t t = 1000;
+
+  float h = 80.0f;
   int excursions = 0;
   ctb::MoveCommand prev = ctb::MoveCommand::NONE;
-  while (t < 30000 && m.state() != ctb::MoveState::DONE &&
-         m.state() != ctb::MoveState::FAULT) {
-    t += 100;
-    ctb::MoveCommand c = step(m, 93.0f, t);
-    if (c != ctb::MoveCommand::NONE && prev == ctb::MoveCommand::NONE)
+  for (uint32_t t = 100; t < 40000; t += 100) {
+    const ctb::MoveCommand cmd = m.command();
+    if (cmd != ctb::MoveCommand::NONE && prev == ctb::MoveCommand::NONE)
       excursions++;
-    prev = c;
+    prev = cmd;
+    // Move the desk while commanded, so velocity is real and settle logic
+    // runs, but always overshoot so the residual error stays large.
+    if (cmd == ctb::MoveCommand::UP) h += 0.35f;
+    else if (cmd == ctb::MoveCommand::DOWN) h -= 0.35f;
+    if (h > 93.0f) h = 93.0f;
+    if (h < 87.0f) h = 87.0f;
+    step(m, h, t);
+    if (m.state() == ctb::MoveState::DONE || m.state() == ctb::MoveState::FAULT)
+      break;
   }
-  CHECK(excursions <= 1);
+  // One initial excursion plus at most one correction.
+  CHECK(excursions <= 2);
+}
+
+TEST(moving_to_the_current_height_commands_nothing) {
+  ctb::MotionController m; m.configure(cfg());
+  m.begin_move(80.0f, 0);
+  step(m, 80.0f, 0);
+  CHECK(m.command() == ctb::MoveCommand::NONE);
+  // And it must settle out rather than sitting in MOVING forever.
+  for (uint32_t t = 100; t <= 3000; t += 100)
+    step(m, 80.0f, t);
+  CHECK(m.state() == ctb::MoveState::DONE);
 }

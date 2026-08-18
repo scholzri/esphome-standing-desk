@@ -109,11 +109,16 @@ void MotionController::process_moving_sample_(float height_cm, uint32_t now_ms) 
   // distance is no bigger than the distance the desk will coast through at
   // its current speed. A zero velocity estimate (fewer than two samples, or
   // fewer than 300 ms between the oldest and newest) must never satisfy
-  // this, or the move would be declared stopped before the desk starts.
+  // this on its own, or the move would be declared stopped before the desk
+  // starts. But remaining <= 0 means the desk is already at or past the
+  // target by position alone, which is true regardless of velocity (e.g.
+  // begin_move() to the height the desk is already sitting at) -- that case
+  // must still stop, not wait forever for a velocity estimate that will
+  // never come because the desk correctly never moves.
   float remaining = remaining_cm_(height_cm);
   float coast_s = (direction_ == MoveCommand::UP) ? cfg_.coast_up_s : cfg_.coast_down_s;
   float coast_cm = coast_s * ((velocity_cm_s_ < 0) ? -velocity_cm_s_ : velocity_cm_s_);
-  if (velocity_cm_s_ != 0.0f && remaining <= coast_cm) {
+  if (remaining <= coast_cm && (velocity_cm_s_ != 0.0f || remaining <= 0.0f)) {
     command_ = MoveCommand::NONE;
     state_ = MoveState::SETTLING;
     settle_start_ms_ = now_ms;
