@@ -11,6 +11,7 @@ class DeskLink : public Component {
   void set_keypad_uart(uart::UARTComponent *u) { this->keypad_uart_ = u; }
   void set_controlbox_uart(uart::UARTComponent *u) { this->controlbox_uart_ = u; }
   void set_capture_port(uint16_t p) { this->capture_port_ = p; }
+  void set_stall_guard_ms(uint32_t ms) { this->stall_guard_ms_ = ms; }
 
   void setup() override;
   void loop() override;
@@ -56,6 +57,11 @@ class DeskLink : public Component {
   char cmd_buf_[192];
   uint8_t cmd_len_{0};
 
+  // How long held keypad bytes may sit unforwarded before the stall guard
+  // (see loop()) flushes them unmodified. Defaults to 30 ms in __init__.py;
+  // see the comment there for why 30 ms is the chosen value.
+  uint32_t stall_guard_ms_{30};
+
   uint8_t inject_buf_[ctb::MAX_FRAME_LEN];
   uint8_t inject_len_{0};
   uint16_t inject_remaining_{0};
@@ -95,6 +101,14 @@ class DeskLink : public Component {
 
   uint32_t seq_{0};
   uint32_t drops_{0};
+
+  // Counts of flush_hold_() calls by cause, reported in STAT so a workstation
+  // script can confirm from outside how often the stall guard is firing --
+  // it should be rare at the default 30 ms, and every firing means some
+  // frame's tail was forwarded unrewritten (see flush_hold_ and the
+  // stall-guard check in loop()).
+  uint32_t stall_flushes_{0};
+  uint32_t full_buffer_flushes_{0};
 };
 
 }  // namespace desk_link

@@ -64,9 +64,27 @@ void DeskLink::loop() {
   // keep the frame's bytes available for handle_keypad_byte_'s completion
   // logic), so hold_len_ alone would stay truthy long after everything held
   // has already been flushed, retriggering this every single pass.
+  //
+  // stall_guard_ms_ defaults to 30 (see __init__.py for the full reasoning):
+  // it must sit well above ESPHome's own loop-scale timing -- a 6-byte
+  // keypad frame occupies only ~3.1 ms of wire time at 19200 baud, well
+  // under the loop's own ~16 ms drain cadence, so completing a frame that
+  // starts being held never legitimately takes longer than about one loop
+  // period; a held frame still incomplete well past that is a genuine gap in
+  // delivery, not routine timing -- while staying below the keypad's 41 ms
+  // frame period, so the control box still receives frames within one
+  // cadence period even after a flush. 10 ms cut it too close to that ~16 ms
+  // loop-period scale for brief, real delivery gaps (a busy WiFi/API/OTA/
+  // capture-socket cooperative loop schedule, not a hardware fault) to clear
+  // without tripping the guard; 30 ms gives real margin while staying more
+  // than an order of magnitude under the ~1 s blank that used to fault the
+  // control box. The subtraction handles millis() rollover the same way the
+  // deadline checks elsewhere in this file do.
   if (this->hold_sent_ < this->hold_len_ &&
-      (uint32_t) (millis() - this->hold_start_ms_) >= 10)
+      (uint32_t) (millis() - this->hold_start_ms_) >= this->stall_guard_ms_) {
     this->flush_hold_("stall guard");
+    this->stall_flushes_++;
+  }
   this->service_hold_expiry_();
   this->service_injection_();
   this->service_capture_();
@@ -95,11 +113,12 @@ void DeskLink::handle_keypad_byte_(uint8_t b) {
   // *after* this one arrives. Flushing here, before a full buffer is asked
   // to hold a 65th byte, keeps hold_buf_ from ever being written out of
   // bounds. This never triggers on real desk traffic -- the largest real
-  // frame is 28 bytes, and the 10 ms stall guard would ordinarily flush long
-  // before 64 bytes ever accumulate -- but nothing here may depend on
-  // "ordinarily".
+  // frame is 28 bytes, and the stall guard (default 30 ms, well under the
+  // keypad's 41 ms frame period) would ordinarily flush long before 64 bytes
+  // ever accumulate -- but nothing here may depend on "ordinarily".
   if (this->hold_len_ >= ctb::MAX_FRAME_LEN) {
     this->flush_hold_("hold buffer full");
+    this->full_buffer_flushes_++;
     this->hold_len_ = 0;
     this->hold_sent_ = 0;
   }
@@ -314,14 +333,22 @@ void DeskLink::handle_command_(char *line) {
     return;
 
   if (strcmp(verb, "STAT") == 0) {
-    char out[160];
+    // Existing fields are kept in place and order -- a workstation script
+    // parses this line -- with the two flush counters appended after them.
+    // sflush/fflush let that script confirm from outside whether the stall
+    // guard (stall_guard_ms_, default 30) is firing during ordinary keypad
+    // traffic (it shouldn't be) versus only on genuine keypad silence.
+    char out[224];
     int n = snprintf(out, sizeof(out),
-                     "# stat seq=%u drops=%u kcrc=%u ksync=%u bcrc=%u bsync=%u\n",
+                     "# stat seq=%u drops=%u kcrc=%u ksync=%u bcrc=%u bsync=%u "
+                     "sflush=%u fflush=%u\n",
                      (unsigned) this->seq_, (unsigned) this->drops_,
                      (unsigned) this->keypad_codec_.crc_errors(),
                      (unsigned) this->keypad_codec_.resyncs(),
                      (unsigned) this->box_codec_.crc_errors(),
-                     (unsigned) this->box_codec_.resyncs());
+                     (unsigned) this->box_codec_.resyncs(),
+                     (unsigned) this->stall_flushes_,
+                     (unsigned) this->full_buffer_flushes_);
     this->capture_write_(out, (size_t) n);
     return;
   }
@@ -445,6 +472,7 @@ void DeskLink::dump_config() {
   ESP_LOGCONFIG(TAG, "Desk Link:");
   ESP_LOGCONFIG(TAG, "  Capture port: %u", this->capture_port_);
   ESP_LOGCONFIG(TAG, "  Max frame length: %u", ctb::MAX_FRAME_LEN);
+  ESP_LOGCONFIG(TAG, "  Stall guard: %u ms", (unsigned) this->stall_guard_ms_);
 }
 
 }  // namespace desk_link

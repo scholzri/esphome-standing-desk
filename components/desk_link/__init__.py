@@ -11,6 +11,7 @@ DeskLink = desk_link_ns.class_("DeskLink", cg.Component)
 CONF_KEYPAD_UART = "keypad_uart"
 CONF_CONTROLBOX_UART = "controlbox_uart"
 CONF_CAPTURE_PORT = "capture_port"
+CONF_STALL_GUARD = "stall_guard"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -18,6 +19,17 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_KEYPAD_UART): cv.use_id(uart.UARTComponent),
         cv.Required(CONF_CONTROLBOX_UART): cv.use_id(uart.UARTComponent),
         cv.Optional(CONF_CAPTURE_PORT, default=6789): cv.port,
+        # Default 30 ms: comfortably above ESPHome's own ~16 ms UART drain
+        # loop cadence (a frame's own wire time is well under one loop
+        # period, so a held frame still incomplete well past that scale
+        # means a genuine gap in delivery, not routine timing) while staying
+        # below the keypad's 41 ms frame period (so the control box still
+        # receives frames within one cadence period even after a flush).
+        # Also more than an order of magnitude tighter than the ~1 s of
+        # stream blanking that originally faulted the control box, so the
+        # guard still bounds worst-case stall time by a wide margin. See the
+        # matching comment on the guard check in desk_link.cpp.
+        cv.Optional(CONF_STALL_GUARD, default="30ms"): cv.positive_time_period_milliseconds,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -33,3 +45,4 @@ async def to_code(config):
     cg.add(var.set_controlbox_uart(controlbox))
 
     cg.add(var.set_capture_port(config[CONF_CAPTURE_PORT]))
+    cg.add(var.set_stall_guard_ms(config[CONF_STALL_GUARD]))
