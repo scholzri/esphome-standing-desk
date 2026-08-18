@@ -62,17 +62,30 @@ class DeskLink : public Component {
   uint16_t inject_interval_ms_{38};
   uint32_t inject_next_ms_{0};
 
-  // Keypad-to-box store-and-forward. Bytes are held here, in lockstep with
-  // whatever keypad_codec_ is accumulating internally, until a frame closes
-  // or the stall guard fires. Only ever holds bytes belonging to a frame that
-  // is genuinely still in flight: a byte is forwarded immediately, never
-  // held, whenever this buffer is empty and the byte is not a sync byte, so
-  // this buffer never contains leading garbage. That invariant is what lets
-  // handle_keypad_byte_() in the .cpp compare hold_len_ directly against a
-  // completed frame's length to decide whether the whole frame is still
-  // pending (safe to rewrite) or partly already sent (must forward as-is).
+  // Keypad-to-box store-and-forward. Every keypad byte -- there is no
+  // byte-immediate path any more -- is appended to hold_buf_ and fed to
+  // keypad_codec_ in lockstep, so hold_buf_[0 .. hold_len_) always holds
+  // exactly the bytes of the frame keypad_codec_ is currently assembling
+  // (or has just completed), whether or not any of it has already been
+  // written out.
+  //
+  // hold_len_ alone cannot tell you whether the codec is mid-frame: the
+  // stall guard (and the full-buffer guard) can write held bytes out to the
+  // control box while the codec is still genuinely mid-frame, and neither
+  // may reset hold_len_ to 0 at that point without losing track of the
+  // frame's already-buffered bytes. So a second counter, hold_sent_, tracks
+  // how many bytes of the *current* frame have already been written to the
+  // control box. hold_sent_ <= hold_len_ always. On frame close:
+  //   - hold_sent_ == 0 means nothing of this frame went out yet, so the
+  //     whole frame is still eligible for rewrite.
+  //   - hold_sent_ > 0 means a prefix already left the building verbatim;
+  //     only the unsent tail hold_buf_[hold_sent_ .. hold_len_) is forwarded,
+  //     never rewritten, since bytes already on the wire can't be recalled.
+  // Both counters reset to 0 only once a frame is fully accounted for
+  // (closed-and-forwarded) or the full-buffer guard forces a hard reset.
   uint8_t hold_buf_[ctb::MAX_FRAME_LEN];
   uint8_t hold_len_{0};
+  uint8_t hold_sent_{0};
   uint32_t hold_start_ms_{0};
 
   // Command-byte override ("hold"), applied only to idle (cmd 0x40) frames.

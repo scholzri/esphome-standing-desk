@@ -59,7 +59,13 @@ void DeskLink::loop() {
   // sending mid-frame (or forever). This is the one check in this file that
   // must never be skipped, because a stall here is exactly the condition
   // that faulted the control box: a gap in the 41 ms keypad stream.
-  if (this->hold_len_ > 0 && (uint32_t) (millis() - this->hold_start_ms_) >= 10)
+  // Guarded on hold_sent_ < hold_len_ (there is unsent, held data right
+  // now), not hold_len_ > 0: flush_hold_ no longer resets hold_len_ (it must
+  // keep the frame's bytes available for handle_keypad_byte_'s completion
+  // logic), so hold_len_ alone would stay truthy long after everything held
+  // has already been flushed, retriggering this every single pass.
+  if (this->hold_sent_ < this->hold_len_ &&
+      (uint32_t) (millis() - this->hold_start_ms_) >= 10)
     this->flush_hold_("stall guard");
   this->service_hold_expiry_();
   this->service_injection_();
@@ -74,82 +80,114 @@ void DeskLink::handle_box_byte_(uint8_t b) {
 
 void DeskLink::handle_keypad_byte_(uint8_t b) {
   // A byte can only be rewritten before it is sent, so keypad->box traffic
-  // is held until a frame closes rather than written byte-immediate. Bytes
-  // that are not part of any frame-in-progress (leading garbage between
-  // frames) are forwarded straight through without ever entering hold_buf_,
-  // which keeps hold_buf_ containing exactly the bytes keypad_codec_ is
-  // accumulating for its current frame -- never anything else. That
-  // invariant is what makes the hold_len_ vs f.len comparison below safe,
-  // and it is why this is a hard "==" rather than "<": nothing is ever
-  // allowed to sit in hold_buf_ that keypad_codec_ does not also consider
-  // part of the frame in progress.
+  // is held until a frame closes rather than written byte-immediate. There
+  // is no separate byte-immediate path any more: every keypad byte, sync or
+  // not, in-frame or not, is appended to hold_buf_ and fed to keypad_codec_.
+  // Frame state (has the codec seen a complete frame yet, and how much of it
+  // has already been written to the control box) is tracked explicitly by
+  // hold_len_/hold_sent_, not inferred from whether hold_len_ happens to be
+  // zero -- hold_len_ == 0 does NOT mean "not mid-frame": the stall guard
+  // and the full-buffer guard can both flush held bytes to the wire while
+  // keypad_codec_ is still genuinely assembling a frame.
   //
   // hold_buf_ is the same size as keypad_codec_'s own frame buffer
   // (MAX_FRAME_LEN), but the codec only checks its own bound on the byte
   // *after* this one arrives. Flushing here, before a full buffer is asked
   // to hold a 65th byte, keeps hold_buf_ from ever being written out of
-  // bounds. Flushing is safe unconditionally, not just when a frame is
-  // mid-flight: it forwards whatever is held, unmodified, so no byte is
-  // ever lost. This never triggers on real desk traffic -- the largest real
+  // bounds. This never triggers on real desk traffic -- the largest real
   // frame is 28 bytes, and the 10 ms stall guard would ordinarily flush long
   // before 64 bytes ever accumulate -- but nothing here may depend on
   // "ordinarily".
-  if (this->hold_len_ >= ctb::MAX_FRAME_LEN)
+  if (this->hold_len_ >= ctb::MAX_FRAME_LEN) {
     this->flush_hold_("hold buffer full");
-
-  if (this->hold_len_ == 0 && b != ctb::SYNC_BYTE) {
-    this->controlbox_uart_->write_byte(b);
-    ctb::Frame discard;
-    this->keypad_codec_.put(b, &discard);  // for capture stats only; not in-frame, no effect
-    return;
+    this->hold_len_ = 0;
+    this->hold_sent_ = 0;
   }
 
   if (this->hold_len_ == 0)
     this->hold_start_ms_ = millis();
   this->hold_buf_[this->hold_len_++] = b;
 
+  // keypad_codec_ has no public "am I mid-frame" query, but resyncs() is a
+  // running count that increments in exactly one place: a byte arrives while
+  // the codec is not in a frame and is not the sync byte, so the codec
+  // discards it as noise without ever absorbing it into any frame (see
+  // FrameCodec::put in frame_codec.cpp). Watching that counter's delta
+  // across this one put() call is how a byte the codec just rejected as
+  // pure inter-frame noise is told apart from a byte that is genuinely
+  // accumulating toward a frame. That distinction matters here because
+  // hold_buf_[0 .. hold_len_) must contain *only* bytes the codec considers
+  // part of the frame currently in progress or just completed -- a noise
+  // byte left sitting in hold_buf_ ahead of the next real frame would throw
+  // off hold_len_/hold_sent_ bookkeeping for that frame (wrong rewrite
+  // offset, wrong CRC base, wrong forwarded length), even though the byte
+  // itself would still reach the box.
+  const uint32_t resyncs_before = this->keypad_codec_.resyncs();
   ctb::Frame f;
   const bool closed = this->keypad_codec_.put(b, &f);
-  if (!closed)
-    return;
 
-  // hold_len_ == f.len whenever nothing was flushed early during this frame
-  // (stall guard or the full-buffer guard above); hold_len_ < f.len means a
-  // prefix already went out verbatim. hold_len_ can never exceed f.len: see
-  // the comment at the top of this function.
-  const bool whole_frame_pending = (this->hold_len_ == f.len);
+  if (!closed) {
+    if (this->keypad_codec_.resyncs() != resyncs_before) {
+      // This byte was never part of any frame; forward it immediately and
+      // drop it back out of hold_buf_/hold_len_ so it can't be mistaken for
+      // a leading byte of whatever frame comes next.
+      this->controlbox_uart_->write_byte(b);
+      this->hold_len_--;
+      if (this->hold_len_ == 0)
+        this->hold_sent_ = 0;
+    }
+    return;
+  }
+
+  // hold_sent_ == 0 means nothing of this now-complete frame has been
+  // written yet, so the whole frame is still eligible for rewrite.
+  // hold_sent_ > 0 means a prefix already left the building verbatim (a
+  // stall-guard or full-buffer flush fired mid-frame); only the unsent tail
+  // is forwarded, and it is forwarded unmodified, because bytes already on
+  // the wire can never be recalled or retroactively changed.
+  const bool whole_frame_pending = (this->hold_sent_ == 0);
   const bool is_idle_shaped = (f.len == 6 && f.bytes[1] == 0xFF);
 
+  if (whole_frame_pending && this->override_active_ && is_idle_shaped &&
+      f.bytes[3] == 0x40) {
+    this->hold_buf_[3] = this->override_cmd_;
+    ctb::crc_append(this->hold_buf_, 4);
+    this->controlbox_uart_->write_array(this->hold_buf_, this->hold_len_);
+  } else {
+    this->controlbox_uart_->write_array(this->hold_buf_ + this->hold_sent_,
+                                        this->hold_len_ - this->hold_sent_);
+  }
+
+  // Hands always win. Runs on every completed frame regardless of which
+  // branch above ran, and regardless of whether this check is seeing the
+  // frame in full or only a tail of it (f.bytes[3] is the codec's own
+  // parsed copy of the command byte, never mutated by the rewrite above): a
+  // real keypress always cancels any active automated hold immediately.
   if (is_idle_shaped && f.bytes[3] != 0x40) {
-    // Hands always win. A real keypress, on a frame we can still see in
-    // full or in part, always cancels any automated hold immediately.
     if (this->override_active_) {
       this->override_active_ = false;
       ESP_LOGI(TAG, "keypad cmd 0x%02X cancels active hold", f.bytes[3]);
     }
   }
 
-  if (whole_frame_pending && this->override_active_ && is_idle_shaped &&
-      f.bytes[3] == 0x40) {
-    this->hold_buf_[3] = this->override_cmd_;
-    ctb::crc_append(this->hold_buf_, 4);
-  }
-
-  this->controlbox_uart_->write_array(this->hold_buf_, this->hold_len_);
   this->hold_len_ = 0;
+  this->hold_sent_ = 0;
 }
 
 void DeskLink::flush_hold_(const char *reason) {
-  if (this->hold_len_ == 0)
+  if (this->hold_sent_ >= this->hold_len_)
     return;
+  const uint8_t n = this->hold_len_ - this->hold_sent_;
   ESP_LOGW(TAG, "keypad->box %s: flushing %u held byte(s) unmodified", reason,
-           (unsigned) this->hold_len_);
-  this->controlbox_uart_->write_array(this->hold_buf_, this->hold_len_);
-  this->hold_len_ = 0;
-  // keypad_codec_ is deliberately left running: it may still be mid-frame,
-  // and the next bytes fed to it continue that same frame. hold_buf_ starts
-  // over empty and will hold only the not-yet-forwarded tail, which is
-  // exactly what handle_keypad_byte_'s hold_len_ <= f.len invariant assumes.
+           (unsigned) n);
+  this->controlbox_uart_->write_array(this->hold_buf_ + this->hold_sent_, n);
+  this->hold_sent_ = this->hold_len_;
+  // hold_len_ is deliberately left unchanged: keypad_codec_ may still be
+  // mid-frame, and hold_buf_[0 .. hold_len_) must keep holding this frame's
+  // already-seen bytes (sent or not) so handle_keypad_byte_'s completion
+  // logic above can still reason about the whole frame -- in particular so
+  // f.bytes[3] is available for the hands-always-win check even when this
+  // flush already sent part of the frame. Only hold_sent_ advances here.
 }
 
 void DeskLink::service_hold_expiry_() {
