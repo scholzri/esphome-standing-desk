@@ -12,6 +12,8 @@ CONF_KEYPAD_UART = "keypad_uart"
 CONF_CONTROLBOX_UART = "controlbox_uart"
 CONF_CAPTURE_PORT = "capture_port"
 CONF_STALL_GUARD = "stall_guard"
+CONF_MIN_HEIGHT = "min_height"
+CONF_MAX_HEIGHT = "max_height"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -30,6 +32,12 @@ CONFIG_SCHEMA = cv.Schema(
         # guard still bounds worst-case stall time by a wide margin. See the
         # matching comment on the guard check in desk_link.cpp.
         cv.Optional(CONF_STALL_GUARD, default="30ms"): cv.positive_time_period_milliseconds,
+        # Feed-forward range passed to MotionController::configure() in
+        # setup(). Defaults are the values measured on this desk (see
+        # motion_controller.h's MotionConfig); exposed here so they can be
+        # tuned from Home Assistant without a recompile.
+        cv.Optional(CONF_MIN_HEIGHT, default=61.0): cv.float_,
+        cv.Optional(CONF_MAX_HEIGHT, default=126.0): cv.float_,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -46,3 +54,5 @@ async def to_code(config):
 
     cg.add(var.set_capture_port(config[CONF_CAPTURE_PORT]))
     cg.add(var.set_stall_guard_ms(config[CONF_STALL_GUARD]))
+    cg.add(var.set_min_height_cm(config[CONF_MIN_HEIGHT]))
+    cg.add(var.set_max_height_cm(config[CONF_MAX_HEIGHT]))

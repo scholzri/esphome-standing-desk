@@ -2,6 +2,8 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/component.h"
 #include "frame_codec.h"
+#include "height_codec.h"
+#include "motion_controller.h"
 
 namespace esphome {
 namespace desk_link {
@@ -12,6 +14,8 @@ class DeskLink : public Component {
   void set_controlbox_uart(uart::UARTComponent *u) { this->controlbox_uart_ = u; }
   void set_capture_port(uint16_t p) { this->capture_port_ = p; }
   void set_stall_guard_ms(uint32_t ms) { this->stall_guard_ms_ = ms; }
+  void set_min_height_cm(float cm) { this->min_height_cm_ = cm; }
+  void set_max_height_cm(float cm) { this->max_height_cm_ = cm; }
 
   void setup() override;
   void loop() override;
@@ -37,6 +41,17 @@ class DeskLink : public Component {
   void set_hold(uint8_t cmd, uint8_t param, uint32_t duration_ms);
   void recall_preset(uint8_t index);   // index 0-3, zero-based on the wire
 
+  // Records the measured height of stored preset `index` (0-3), so move_to()
+  // can recognise when a requested target matches it. 0 means unknown/unset.
+  void set_preset_height(uint8_t index, float height_cm);
+  // Moves the desk to `target_cm`. Delegates to the box's own preset
+  // positioning when the target is within PRESET_MATCH_CM of a known preset
+  // height (it stops exactly on target using its own deceleration ramp,
+  // which feed-forward cannot match); otherwise drives the feed-forward
+  // controller_.
+  void move_to(float target_cm);
+  ctb::MotionController &controller() { return this->controller_; }
+
  protected:
   void handle_keypad_byte_(uint8_t b);
   void handle_box_byte_(uint8_t b);
@@ -54,6 +69,14 @@ class DeskLink : public Component {
   ctb::FrameCodec keypad_codec_{ctb::Direction::KEYPAD_TO_BOX};
   ctb::FrameCodec box_codec_{ctb::Direction::BOX_TO_KEYPAD};
 
+  // Feed-forward motion controller, configured from min_height_cm_/
+  // max_height_cm_ in setup() and driven from every decoded box height frame
+  // in handle_box_byte_(). move_to() delegates to recall_preset() instead of
+  // this controller when the target matches a stored preset height.
+  ctb::MotionController controller_;
+  float preset_heights_[4]{0, 0, 0, 0};   // 0 means unknown
+  static constexpr float PRESET_MATCH_CM = 0.6f;
+
   uint16_t capture_port_{6789};
   int listen_fd_{-1};
   int client_fd_{-1};
@@ -64,6 +87,12 @@ class DeskLink : public Component {
   // (see loop()) flushes them unmodified. Defaults to 30 ms in __init__.py;
   // see the comment there for why 30 ms is the chosen value.
   uint32_t stall_guard_ms_{30};
+
+  // Range passed to controller_.configure() in setup(). Defaults match
+  // MotionConfig's own (61.0 / 126.0); configurable from __init__.py as
+  // min_height / max_height.
+  float min_height_cm_{61.0f};
+  float max_height_cm_{126.0f};
 
   uint8_t inject_buf_[ctb::MAX_FRAME_LEN];
   uint8_t inject_len_{0};

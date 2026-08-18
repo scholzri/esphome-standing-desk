@@ -200,3 +200,41 @@ TEST(moving_to_the_current_height_commands_nothing) {
     step(m, 80.0f, t);
   CHECK(m.state() == ctb::MoveState::DONE);
 }
+
+TEST(states_reachable_without_begin_move_report_no_command) {
+  // desk_link.cpp relies on this: while a preset recall is running, the
+  // controller is never given begin_move for that request, so it sits in
+  // whatever state its LAST real move left it. Only if every such state
+  // reports command()==NONE is it safe to treat "controller says NONE" as
+  // "safe to release" without also cancelling an unrelated preset recall.
+  ctb::MotionController m; m.configure(cfg());
+
+  // Freshly constructed and configured, never moved: IDLE.
+  CHECK(m.command() == ctb::MoveCommand::NONE);
+
+  // A move that completes normally: DONE.
+  m.begin_move(70.0f, 0);
+  float h = 62.0f;
+  for (uint32_t t = 0; t < 30000 && m.state() != ctb::MoveState::DONE; t += 40) {
+    ctb::MoveCommand c = m.command();
+    if (c == ctb::MoveCommand::UP) h += 0.14f;
+    else if (c == ctb::MoveCommand::DOWN) h -= 0.14f;
+    m.update(h, true, t);
+  }
+  CHECK(m.state() == ctb::MoveState::DONE);
+  CHECK(m.command() == ctb::MoveCommand::NONE);
+
+  // A move that faults (out of range): FAULT.
+  ctb::MotionController m2; m2.configure(cfg());
+  m2.begin_move(999.0f, 0);
+  CHECK(m2.state() == ctb::MoveState::FAULT);
+  CHECK(m2.command() == ctb::MoveCommand::NONE);
+
+  // An aborted move: FAULT via ABORTED.
+  ctb::MotionController m3; m3.configure(cfg());
+  m3.begin_move(90.0f, 0);
+  m3.update(80.0f, true, 10);
+  m3.abort(20);
+  CHECK(m3.state() == ctb::MoveState::FAULT);
+  CHECK(m3.command() == ctb::MoveCommand::NONE);
+}

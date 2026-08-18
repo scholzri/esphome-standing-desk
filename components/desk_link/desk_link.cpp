@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <lwip/sockets.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,11 @@ namespace desk_link {
 static const char *const TAG = "desk_link";
 
 void DeskLink::setup() {
+  ctb::MotionConfig mc;
+  mc.min_height_cm = this->min_height_cm_;
+  mc.max_height_cm = this->max_height_cm_;
+  this->controller_.configure(mc);
+
   this->listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (this->listen_fd_ < 0) {
     ESP_LOGE(TAG, "socket() failed: errno %d", errno);
@@ -92,8 +98,34 @@ void DeskLink::loop() {
 
 void DeskLink::handle_box_byte_(uint8_t b) {
   ctb::Frame f;
-  if (this->box_codec_.put(b, &f))
-    this->emit_frame_(ctb::Direction::BOX_TO_KEYPAD, f);
+  if (!this->box_codec_.put(b, &f))
+    return;
+  this->emit_frame_(ctb::Direction::BOX_TO_KEYPAD, f);
+
+  // Negative means "not a height report": a button frame, a malformed frame,
+  // or the sleep sentinel. The desk being asleep is exactly the invalid-height
+  // case the controller's wake handling exists for.
+  const float h = ctb::decode_height_frame(f);
+  const bool valid = (h >= 0.0f);
+  this->controller_.update(valid ? h : 0.0f, valid, millis());
+
+  switch (this->controller_.command()) {
+    case ctb::MoveCommand::UP:
+      this->set_hold(0x50, 0x00, 200);
+      break;
+    case ctb::MoveCommand::DOWN:
+      this->set_hold(0x60, 0x00, 200);
+      break;
+    case ctb::MoveCommand::NONE:
+      // Never cancel an active preset recall from here (its command byte is
+      // 0x48): it must run to completion on its own, cancelled only by a
+      // real keypress (hands-always-win, in handle_keypad_byte_) or its own
+      // natural expiry. Any other active override is a feed-forward hold
+      // that the controller itself has now decided to stop, so release it.
+      if (this->override_active_ && this->override_cmd_ != 0x48)
+        this->set_hold(0x40, 0x00, 0);
+      break;
+  }
 }
 
 void DeskLink::handle_keypad_byte_(uint8_t b) {
@@ -523,6 +555,35 @@ void DeskLink::recall_preset(uint8_t index) {
   // than the 41 ms cadence, so the box sees a real press rather than a
   // bounce, and it then positions the desk itself.
   this->set_hold(0x48, index, 400);
+}
+
+void DeskLink::set_preset_height(uint8_t index, float height_cm) {
+  if (index < 4)
+    this->preset_heights_[index] = height_cm;
+}
+
+void DeskLink::move_to(float target_cm) {
+  // Prefer the control box's own positioning when the target is one of the
+  // stored presets: it runs a factory deceleration ramp and stops exactly on
+  // target, which feed-forward cannot match. preset_heights_[i] == 0 means
+  // that preset's height has never been recorded, so it is skipped rather
+  // than treated as a real match at 0 cm.
+  // First match wins, in ascending preset index. If two presets are closer
+  // together than 2*PRESET_MATCH_CM (observed on this hardware: presets 1 and
+  // 4 are 0.5 cm apart against a 0.6 cm match radius), a target in the overlap
+  // deterministically resolves to the lower-indexed preset rather than the
+  // nearer one. Acceptable: the two candidates are already within the match
+  // radius of the requested target, so either is "close enough" by definition.
+  for (uint8_t i = 0; i < 4; i++) {
+    if (this->preset_heights_[i] > 0 &&
+        fabsf(this->preset_heights_[i] - target_cm) <= PRESET_MATCH_CM) {
+      ESP_LOGI(TAG, "target %.1f matches preset %u; delegating to the box",
+               target_cm, (unsigned) (i + 1));
+      this->recall_preset(i);
+      return;
+    }
+  }
+  this->controller_.begin_move(target_cm, millis());
 }
 
 void DeskLink::dump_config() {
