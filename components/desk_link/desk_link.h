@@ -43,10 +43,11 @@ class DeskLink : public Component {
   float min_height_cm() const { return this->min_height_cm_; }
   float max_height_cm() const { return this->max_height_cm_; }
 
-  // Optional: when set, handle_box_byte_() publishes every valid decoded
-  // height directly to this sensor, at line rate (one publish per box height
-  // frame, i.e. the box's own ~40 ms cadence) rather than the 500 ms poll
-  // the old standing_desk_height component used. desk_link now owns both
+  // Optional: when set, handle_box_byte_() publishes decoded heights
+  // directly to this sensor, at line rate (checked on every box height
+  // frame, i.e. the box's own ~40 ms cadence, and published whenever the
+  // value changes) rather than the 500 ms poll the old standing_desk_height
+  // component used. desk_link now owns both
   // UARTs exclusively (see the class comment history in desk_link.cpp), so
   // a separate polling sensor reading the same controlbox UART id is no
   // longer possible; this replaces that role directly instead. Optional

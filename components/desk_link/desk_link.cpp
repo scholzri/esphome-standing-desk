@@ -50,17 +50,31 @@ void DeskLink::setup() {
 }
 
 void DeskLink::loop() {
-  uint8_t b;
-  while (this->keypad_uart_->available()) {
-    this->keypad_uart_->read_byte(&b);
-    this->handle_keypad_byte_(b);
+  // Drained in chunks rather than a byte at a time: every available(),
+  // read_byte() and write_byte() is its own ESP-IDF driver call with its own
+  // locking, so per-byte I/O cost three driver round trips per byte. Bytes
+  // are still handled one by one, in arrival order, exactly as before.
+  uint8_t buf[64];
+  size_t n;
+  while ((n = this->keypad_uart_->available()) > 0) {
+    if (n > sizeof(buf))
+      n = sizeof(buf);
+    if (!this->keypad_uart_->read_array(buf, n))
+      break;
+    for (size_t i = 0; i < n; i++)
+      this->handle_keypad_byte_(buf[i]);
   }
-  while (this->controlbox_uart_->available()) {
-    this->controlbox_uart_->read_byte(&b);
-    // The box stream is always forwarded, byte-immediate, unchanged. The
-    // keypad display must never go dark.
-    this->keypad_uart_->write_byte(b);
-    this->handle_box_byte_(b);
+  while ((n = this->controlbox_uart_->available()) > 0) {
+    if (n > sizeof(buf))
+      n = sizeof(buf);
+    if (!this->controlbox_uart_->read_array(buf, n))
+      break;
+    // The box stream is always forwarded unchanged, before any of it is
+    // decoded, so the keypad display never waits on the decode path and
+    // never goes dark.
+    this->keypad_uart_->write_array(buf, n);
+    for (size_t i = 0; i < n; i++)
+      this->handle_box_byte_(buf[i]);
   }
   // Checked every pass, not only when a keypad byte just arrived: the stall
   // guard bounds wall-clock time held, and the keypad can simply stop
@@ -110,22 +124,24 @@ void DeskLink::handle_box_byte_(uint8_t b) {
   const float h = ctb::decode_height_frame(f);
   const bool valid = (h >= 0.0f);
   if (valid) {
+    // Published at line rate (not on a poll timer), but only when the value
+    // actually changed. The box repeats its height report every ~42 ms even
+    // while the desk is idle, and Sensor::publish_state() does not dedupe,
+    // so publishing every frame meant ~23 identical states per second, around
+    // the clock, into the API, web_server and any on_value automations. The
+    // captures in test/fixtures bear this out: idle.log carries 1394 height
+    // frames and one distinct value; manual_up_press.log carries 1328 frames
+    // and 40 changes. Comparing exactly is safe: decode_height_frame() builds
+    // every value from the same integer digits, so equal frames give equal
+    // floats. Checked before last_height_cm_ is overwritten below.
+    const bool changed = !this->has_height_ || h != this->last_height_cm_;
     // Cached here, not just fed to controller_.update(), so anything that
     // needs "the current height" but isn't the motion controller itself
     // (desk_cover's position feedback) has one place to read it rather than
     // each keeping its own copy in step with this same decode.
     this->last_height_cm_ = h;
     this->has_height_ = true;
-    // Published directly on every valid frame (roughly the box's own
-    // ~40 ms cadence), not on a poll timer: this is what "fed at line rate
-    // rather than the old 500 ms poll" means for desk_height.
-    // Sensor::publish_state() does not deduplicate by value, so a
-    // stationary desk still republishes the same reading on this cadence --
-    // the same thing any other line-rate sensor does; the API layer and HA
-    // recorder are both built to cope with that, and the alternative (a
-    // manual last-value check here) would just reimplement what filters or
-    // recorder-side dedup already do more generally.
-    if (this->height_sensor_ != nullptr)
+    if (changed && this->height_sensor_ != nullptr)
       this->height_sensor_->publish_state(h);
   }
   this->controller_.update(valid ? h : 0.0f, valid, millis());
@@ -596,14 +612,23 @@ void DeskLink::set_hold(uint8_t cmd, uint8_t param, uint32_t duration_ms) {
     ESP_LOGI(TAG, "hold released");
     return;
   }
+  // During a feed-forward move the controller dispatch in handle_box_byte_
+  // re-issues the same UP/DOWN hold on every box frame (~42 ms) purely to
+  // push the deadline out. Logging each of those refreshes produced ~24 INFO
+  // lines a second for the whole move, formatted and written to the log
+  // UART and API log stream from inside the forwarding loop, exactly while
+  // timing matters most. Only a hold that actually changes is logged.
+  const bool refresh = this->override_active_ && this->override_cmd_ == cmd &&
+                       this->override_param_ == param;
   this->override_cmd_ = cmd;
   this->override_param_ = param;
   // Assign the existing expiry field that service_hold_expiry_ already
   // checks, rather than adding a parallel one.
   this->override_deadline_ms_ = millis() + duration_ms;
   this->override_active_ = true;
-  ESP_LOGI(TAG, "hold cmd=0x%02X param=0x%02X duration=%u ms", cmd, param,
-           (unsigned) duration_ms);
+  if (!refresh)
+    ESP_LOGI(TAG, "hold cmd=0x%02X param=0x%02X duration=%u ms", cmd, param,
+             (unsigned) duration_ms);
 }
 
 void DeskLink::recall_preset(uint8_t index) {
