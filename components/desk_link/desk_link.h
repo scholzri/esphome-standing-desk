@@ -93,6 +93,30 @@ class DeskLink : public Component {
   uint32_t box_crc_errors() const { return this->box_codec_.crc_errors(); }
   uint32_t box_resyncs() const { return this->box_codec_.resyncs(); }
 
+  // Longest gap, in ms, between two consecutive writes to the control box
+  // since the previous call, which then starts a new window. The box is
+  // known to fault when the keypad stream it receives has a gap, and every
+  // keypad byte reaches it only through write_box_(), so this is the direct
+  // measure of whether such a gap happened. Meant for a polled sensor, so
+  // each reading is the worst case of its own poll interval.
+  uint32_t take_max_box_tx_gap_ms() {
+    const uint32_t v = this->max_box_tx_gap_ms_;
+    this->max_box_tx_gap_ms_ = 0;
+    return v;
+  }
+
+  // Box silence detection: the box transmits every ~42 ms whether the desk
+  // is awake or asleep, so BOX_SILENCE_MS without a single byte from it
+  // means the box has stopped talking. box_silences() counts how often that
+  // has happened since boot. box_silence_info() describes the latest one
+  // (what the box last said, what was being commanded, how recently the
+  // keypad was heard and the box was written to) and is extended once the
+  // box speaks again. box_silence_info_version() changes whenever the text
+  // does, so a polled text sensor can publish only on change.
+  uint32_t box_silences() const { return this->box_silences_; }
+  const char *box_silence_info() const { return this->box_silence_info_; }
+  uint32_t box_silence_info_version() const { return this->box_silence_info_version_; }
+
   // Last height decoded from the box stream, and whether one has ever been
   // seen. handle_box_byte_() already computes this on every box height frame
   // (to feed controller_.update()) but previously discarded it; it is now
@@ -168,6 +192,11 @@ class DeskLink : public Component {
   void service_capture_();
   void handle_command_(char *line);
   void capture_write_(const char *s, size_t len);
+  // The only path to the control box UART, so every write is timed for
+  // take_max_box_tx_gap_ms().
+  void write_box_(const uint8_t *data, size_t len);
+  void service_box_silence_();
+  void note_box_rx_(uint32_t now);
 
   uart::UARTComponent *keypad_uart_{nullptr};
   uart::UARTComponent *controlbox_uart_{nullptr};
@@ -285,6 +314,27 @@ class DeskLink : public Component {
   // stall-guard check in loop()).
   uint32_t stall_flushes_{0};
   uint32_t full_buffer_flushes_{0};
+
+  // Timing for take_max_box_tx_gap_ms(). box_tx_seen_ keeps the first write
+  // after boot from being measured against time zero.
+  uint32_t last_box_tx_ms_{0};
+  bool box_tx_seen_{false};
+  uint32_t max_box_tx_gap_ms_{0};
+
+  // State for box silence detection; see box_silence_info(). last_box_frame_
+  // is the last complete frame the box sent, kept so a silence report can
+  // say what the box was showing right before it went quiet.
+  static constexpr uint32_t BOX_SILENCE_MS = 1000;
+  uint32_t last_box_rx_ms_{0};
+  uint32_t last_keypad_rx_ms_{0};
+  bool box_rx_seen_{false};
+  bool box_silent_{false};
+  uint32_t box_silent_since_ms_{0};
+  uint32_t box_silences_{0};
+  uint8_t last_box_frame_[ctb::MAX_FRAME_LEN];
+  uint8_t last_box_frame_len_{0};
+  char box_silence_info_[200]{"none"};
+  uint32_t box_silence_info_version_{0};
 };
 
 }  // namespace desk_link

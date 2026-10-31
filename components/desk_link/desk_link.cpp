@@ -61,6 +61,7 @@ void DeskLink::loop() {
       n = sizeof(buf);
     if (!this->keypad_uart_->read_array(buf, n))
       break;
+    this->last_keypad_rx_ms_ = millis();
     for (size_t i = 0; i < n; i++)
       this->handle_keypad_byte_(buf[i]);
   }
@@ -69,6 +70,7 @@ void DeskLink::loop() {
       n = sizeof(buf);
     if (!this->controlbox_uart_->read_array(buf, n))
       break;
+    this->note_box_rx_(millis());
     // The box stream is always forwarded unchanged, before any of it is
     // decoded, so the keypad display never waits on the decode path and
     // never goes dark.
@@ -110,12 +112,88 @@ void DeskLink::loop() {
   this->service_hold_expiry_();
   this->service_injection_();
   this->service_capture_();
+  this->service_box_silence_();
+}
+
+void DeskLink::write_box_(const uint8_t *data, size_t len) {
+  const uint32_t now = millis();
+  if (this->box_tx_seen_) {
+    const uint32_t gap = now - this->last_box_tx_ms_;
+    if (gap > this->max_box_tx_gap_ms_)
+      this->max_box_tx_gap_ms_ = gap;
+  }
+  this->box_tx_seen_ = true;
+  this->last_box_tx_ms_ = now;
+  this->controlbox_uart_->write_array(data, len);
+}
+
+static const char *move_state_name(ctb::MoveState s) {
+  switch (s) {
+    case ctb::MoveState::IDLE: return "idle";
+    case ctb::MoveState::WAKING: return "waking";
+    case ctb::MoveState::MOVING: return "moving";
+    case ctb::MoveState::SETTLING: return "settling";
+    case ctb::MoveState::DONE: return "done";
+    case ctb::MoveState::FAULT: return "fault";
+  }
+  return "unknown";
+}
+
+void DeskLink::note_box_rx_(uint32_t now) {
+  this->last_box_rx_ms_ = now;
+  this->box_rx_seen_ = true;
+  if (!this->box_silent_)
+    return;
+  // The box is talking again: finish the report that service_box_silence_()
+  // started, so it records how long the silence lasted.
+  this->box_silent_ = false;
+  const uint32_t lasted = now - this->box_silent_since_ms_;
+  const size_t used = strlen(this->box_silence_info_);
+  snprintf(this->box_silence_info_ + used, sizeof(this->box_silence_info_) - used,
+           "; box back after %u ms", (unsigned) lasted);
+  this->box_silence_info_version_++;
+  ESP_LOGW(TAG, "control box transmitting again after %u ms of silence", (unsigned) lasted);
+}
+
+void DeskLink::service_box_silence_() {
+  if (!this->box_rx_seen_ || this->box_silent_)
+    return;
+  const uint32_t now = millis();
+  if ((uint32_t) (now - this->last_box_rx_ms_) < BOX_SILENCE_MS)
+    return;
+
+  this->box_silent_ = true;
+  this->box_silent_since_ms_ = this->last_box_rx_ms_;
+  this->box_silences_++;
+
+  char frame[2 * ctb::MAX_FRAME_LEN + 1] = "";
+  for (uint8_t i = 0; i < this->last_box_frame_len_ && i < 8; i++)
+    snprintf(frame + 2 * i, sizeof(frame) - 2 * i, "%02X", this->last_box_frame_[i]);
+  char hold[16] = "none";
+  if (this->override_active_)
+    snprintf(hold, sizeof(hold), "%02X/%02X", this->override_cmd_, this->override_param_);
+
+  // The two "ago" times are taken now, at detection. Both near zero means
+  // the keypad is still talking and the ESP is still forwarding it, so the
+  // box went quiet on its own; both large means the keypad or the ESP had
+  // stopped first.
+  snprintf(this->box_silence_info_, sizeof(this->box_silence_info_),
+           "#%u at uptime %us: last frame %s, height %.1f, hold %s, controller %s, "
+           "keypad heard %ums ago, box written %ums ago",
+           (unsigned) this->box_silences_, (unsigned) (this->last_box_rx_ms_ / 1000), frame,
+           this->last_height_cm_, hold, move_state_name(this->controller_.state()),
+           (unsigned) (now - this->last_keypad_rx_ms_), (unsigned) (now - this->last_box_tx_ms_));
+  this->box_silence_info_version_++;
+  ESP_LOGW(TAG, "control box silent for %u ms: %s", (unsigned) BOX_SILENCE_MS,
+           this->box_silence_info_);
 }
 
 void DeskLink::handle_box_byte_(uint8_t b) {
   ctb::Frame f;
   if (!this->box_codec_.put(b, &f))
     return;
+  memcpy(this->last_box_frame_, f.bytes, f.len);
+  this->last_box_frame_len_ = f.len;
   this->emit_frame_(ctb::Direction::BOX_TO_KEYPAD, f);
 
   // Negative means "not a height report": a button frame, a malformed frame,
@@ -231,7 +309,7 @@ void DeskLink::handle_keypad_byte_(uint8_t b) {
       // This byte was never part of any frame; forward it immediately and
       // drop it back out of hold_buf_/hold_len_ so it can't be mistaken for
       // a leading byte of whatever frame comes next.
-      this->controlbox_uart_->write_byte(b);
+      this->write_box_(&b, 1);
       this->hold_len_--;
       if (this->hold_len_ == 0)
         this->hold_sent_ = 0;
@@ -257,10 +335,10 @@ void DeskLink::handle_keypad_byte_(uint8_t b) {
     this->hold_buf_[2] = this->override_param_;
     this->hold_buf_[3] = this->override_cmd_;
     ctb::crc_append(this->hold_buf_, 4);
-    this->controlbox_uart_->write_array(this->hold_buf_, this->hold_len_);
+    this->write_box_(this->hold_buf_, this->hold_len_);
   } else {
-    this->controlbox_uart_->write_array(this->hold_buf_ + this->hold_sent_,
-                                        this->hold_len_ - this->hold_sent_);
+    this->write_box_(this->hold_buf_ + this->hold_sent_,
+                     this->hold_len_ - this->hold_sent_);
   }
 
   // Hands always win. Runs on every completed frame regardless of which
@@ -306,7 +384,7 @@ void DeskLink::flush_hold_(const char *reason) {
   const uint8_t n = this->hold_len_ - this->hold_sent_;
   ESP_LOGW(TAG, "keypad->box %s: flushing %u held byte(s) unmodified", reason,
            (unsigned) n);
-  this->controlbox_uart_->write_array(this->hold_buf_ + this->hold_sent_, n);
+  this->write_box_(this->hold_buf_ + this->hold_sent_, n);
   this->hold_sent_ = this->hold_len_;
   // hold_len_ is deliberately left unchanged: keypad_codec_ may still be
   // mid-frame, and hold_buf_[0 .. hold_len_) must keep holding this frame's
@@ -576,7 +654,7 @@ void DeskLink::service_injection_() {
   if ((int32_t) (now - this->inject_next_ms_) < 0)
     return;
 
-  this->controlbox_uart_->write_array(this->inject_buf_, this->inject_len_);
+  this->write_box_(this->inject_buf_, this->inject_len_);
   this->inject_remaining_--;
   // The timer is armed only here, immediately after a send, and nothing else
   // touches it. This is the discipline the old desk_keypad component lacked:
